@@ -1,0 +1,19 @@
+# Local runtime data
+data/*.json
+data/*.backup-*.json
+backups/
+
+# Logs and generated archives
+*.log
+*.rar
+*.zip
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+
+!.gitignore
+!data/.gitkeep
+!data/store.example.json
