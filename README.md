@@ -1,4 +1,4 @@
-# Sword 2.0
+# Sword 3.0
 
 <p align="center">
   <img src="./public/sword-logo.svg" alt="Sword logo" width="96">
@@ -16,7 +16,7 @@
 
 ## Visao geral
 
-Evolucao do MVP com autenticacao, usuarios e papeis operacionais.
+Primeira versao com identidade Sword e endurecimento de seguranca.
 
 Sword foi criado e desenvolvido por Lucas Lima (LucasLimaSzDev) como uma
 solucao local para acompanhar disponibilidade, ativos, alertas e incidentes de
@@ -24,11 +24,11 @@ infraestrutura.
 
 ## Destaques da versao
 
-- Setup do primeiro administrador.
-- Login e logout com sessao em cookie HttpOnly.
-- Cargos de Administrador, Operador e Visualizador.
-- Gestao de usuarios para administradores.
-- Senhas com PBKDF2-SHA256 e salt individual.
+- Identidade visual Sword.
+- CSRF em acoes de escrita.
+- Rate limit de login.
+- Headers defensivos e politica CSP.
+- Auditoria administrativa, backup manual e exportacao controlada por cargo.
 
 ## Como executar
 

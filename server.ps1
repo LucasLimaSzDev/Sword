@@ -10,6 +10,27 @@ $ErrorActionPreference = "Stop"
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $PublicDir = Join-Path $Root "public"
 $DataFile = Join-Path $Root "data\store.json"
+$BackupDir = Join-Path $Root "backups"
+$script:LoginAttempts = @{}
+
+function Get-DefaultSettings {
+  return [pscustomobject][ordered]@{
+    app_name = "Sword"
+    security_mode = "hardened-local"
+    session_hours = 8
+    login_rate_limit_window_minutes = 15
+    login_rate_limit_max_attempts = 5
+    audit_retention_days = 180
+    event_retention_days = 365
+    backup_retention_days = 30
+    check_interval_seconds = $CheckIntervalSeconds
+    check_attempts = $Attempts
+    check_timeout_ms = $TimeoutMs
+    require_csrf = $true
+    allow_viewer_export = $false
+    updated_at = Get-NowIso
+  }
+}
 
 function Get-NowIso {
   return (Get-Date).ToString("o")
@@ -61,6 +82,9 @@ function Read-Store {
   $store | Add-Member -NotePropertyName users -NotePropertyValue @(Get-CleanArray $store.users) -Force
   $store | Add-Member -NotePropertyName sessions -NotePropertyValue @(Get-CleanArray $store.sessions) -Force
   $store | Add-Member -NotePropertyName audit_logs -NotePropertyValue @(Get-CleanArray $store.audit_logs) -Force
+  if ($null -eq $store.settings) {
+    $store | Add-Member -NotePropertyName settings -NotePropertyValue (Get-DefaultSettings) -Force
+  }
   return $store
 }
 
@@ -71,6 +95,9 @@ function Save-Store($Store) {
   $Store | Add-Member -NotePropertyName users -NotePropertyValue @(Get-CleanArray $Store.users) -Force
   $Store | Add-Member -NotePropertyName sessions -NotePropertyValue @(Get-CleanArray $Store.sessions) -Force
   $Store | Add-Member -NotePropertyName audit_logs -NotePropertyValue @(Get-CleanArray $Store.audit_logs) -Force
+  if ($null -eq $Store.settings) {
+    $Store | Add-Member -NotePropertyName settings -NotePropertyValue (Get-DefaultSettings) -Force
+  }
   ConvertTo-Json -InputObject $Store -Depth 20 -Compress | Set-Content -LiteralPath $DataFile -Encoding UTF8
 }
 
@@ -105,11 +132,22 @@ function Send-Raw($Context, [byte[]]$Bytes, [string]$ContentType, [int]$StatusCo
     401 { "Unauthorized" }
     403 { "Forbidden" }
     404 { "Not Found" }
+    429 { "Too Many Requests" }
     500 { "Internal Server Error" }
     default { "OK" }
   }
 
   $extra = ""
+  $securityHeaders = @(
+    "X-Content-Type-Options: nosniff",
+    "X-Frame-Options: DENY",
+    "Referrer-Policy: no-referrer",
+    "Permissions-Policy: geolocation=(), microphone=(), camera=()",
+    "Content-Security-Policy: default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+  )
+  foreach ($line in $securityHeaders) {
+    $extra += "$line`r`n"
+  }
   foreach ($line in $ExtraHeaders) {
     if (-not [string]::IsNullOrWhiteSpace($line)) {
       $extra += "$line`r`n"
@@ -272,6 +310,10 @@ function New-SessionToken {
   return ConvertTo-Base64Url (Get-RandomBytes 32)
 }
 
+function New-CsrfToken {
+  return ConvertTo-Base64Url (Get-RandomBytes 24)
+}
+
 function Get-CookieValue($Request, [string]$Name) {
   if ($null -eq $Request.Headers -or -not $Request.Headers.ContainsKey("cookie")) {
     return $null
@@ -304,6 +346,29 @@ function Get-PublicUser($User) {
   }
 }
 
+function Get-PublicSettings($Settings) {
+  if ($null -eq $Settings) {
+    $Settings = Get-DefaultSettings
+  }
+
+  return [pscustomobject][ordered]@{
+    app_name = $Settings.app_name
+    security_mode = $Settings.security_mode
+    session_hours = [int]$Settings.session_hours
+    login_rate_limit_window_minutes = [int]$Settings.login_rate_limit_window_minutes
+    login_rate_limit_max_attempts = [int]$Settings.login_rate_limit_max_attempts
+    audit_retention_days = [int]$Settings.audit_retention_days
+    event_retention_days = [int]$Settings.event_retention_days
+    backup_retention_days = [int]$Settings.backup_retention_days
+    check_interval_seconds = [int]$Settings.check_interval_seconds
+    check_attempts = [int]$Settings.check_attempts
+    check_timeout_ms = [int]$Settings.check_timeout_ms
+    require_csrf = [bool]$Settings.require_csrf
+    allow_viewer_export = [bool]$Settings.allow_viewer_export
+    updated_at = $Settings.updated_at
+  }
+}
+
 function Get-RoleLabel([string]$Role) {
   switch ("$Role".ToLowerInvariant()) {
     "admin" { "Administrador" }
@@ -318,7 +383,7 @@ function Test-RoleAllowed([string]$Role, [string[]]$AllowedRoles) {
 }
 
 function Get-CurrentUser($Store, $Request) {
-  $token = Get-CookieValue $Request "monitor_session"
+  $token = Get-CookieValue $Request "sword_session"
   if ([string]::IsNullOrWhiteSpace($token)) {
     return $null
   }
@@ -343,6 +408,46 @@ function Get-CurrentUser($Store, $Request) {
     Select-Object -First 1
 
   return $user
+}
+
+function Get-CurrentSession($Store, $Request) {
+  $token = Get-CookieValue $Request "sword_session"
+  if ([string]::IsNullOrWhiteSpace($token)) {
+    return $null
+  }
+
+  $tokenHash = Get-TokenHash $token
+  $now = Get-Date
+  return @(Get-CleanArray $Store.sessions) |
+    Where-Object { $_.token_hash -eq $tokenHash -and $_.status -eq "active" -and [datetime]::Parse($_.expires_at) -gt $now } |
+    Select-Object -First 1
+}
+
+function Test-Csrf($Store, $Request) {
+  if ($Store.settings.require_csrf -ne $true) {
+    return $true
+  }
+
+  $method = "$($Request.HttpMethod)".ToUpperInvariant()
+  if ($method -notin @("POST", "PUT", "DELETE", "PATCH")) {
+    return $true
+  }
+
+  $path = $Request.Url.AbsolutePath.TrimEnd("/")
+  if ($path -in @("/api/auth/setup", "/api/auth/login", "/api/auth/logout")) {
+    return $true
+  }
+
+  $session = Get-CurrentSession $Store $Request
+  if ($null -eq $session -or [string]::IsNullOrWhiteSpace($session.csrf_token)) {
+    return $false
+  }
+
+  if ($null -eq $Request.Headers -or -not $Request.Headers.ContainsKey("x-csrf-token")) {
+    return $false
+  }
+
+  return "$($Request.Headers["x-csrf-token"])" -eq "$($session.csrf_token)"
 }
 
 function Get-UserByEmail($Store, [string]$Email) {
@@ -371,6 +476,95 @@ function Add-AuditLog($Store, $User, [string]$Action, [string]$EntityType, [stri
   $Store.audit_logs = @(Get-CleanArray $Store.audit_logs) + $entry
 }
 
+function Get-AuditRows($Store) {
+  return @(Get-CleanArray $Store.audit_logs) |
+    Sort-Object { [datetime]::Parse($_.created_at) } -Descending |
+    Select-Object -First 500 |
+    ForEach-Object {
+      $user = Get-UserById $Store $_.user_id
+      [pscustomobject][ordered]@{
+        id = $_.id
+        user_id = $_.user_id
+        user_name = if ($null -eq $user) { "Sistema" } else { $user.name }
+        action = $_.action
+        entity_type = $_.entity_type
+        entity_id = $_.entity_id
+        created_at = $_.created_at
+        metadata = $_.metadata
+      }
+    }
+}
+
+function Invoke-RetentionCleanup($Store) {
+  $settings = Get-PublicSettings $Store.settings
+  $now = Get-Date
+  $auditCutoff = $now.AddDays(-[int]$settings.audit_retention_days)
+  $eventCutoff = $now.AddDays(-[int]$settings.event_retention_days)
+
+  $Store.audit_logs = @(Get-CleanArray $Store.audit_logs | Where-Object { [datetime]::Parse($_.created_at) -ge $auditCutoff })
+  $Store.status_events = @(Get-CleanArray $Store.status_events | Where-Object { $_.status -eq "open" -or [datetime]::Parse($_.created_at) -ge $eventCutoff })
+}
+
+function New-Backup($Store, $User) {
+  if (-not (Test-Path -LiteralPath $BackupDir)) {
+    New-Item -ItemType Directory -Path $BackupDir | Out-Null
+  }
+
+  $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+  $fileName = "sword-backup-$stamp.json"
+  $path = Join-Path $BackupDir $fileName
+  ConvertTo-Json -InputObject $Store -Depth 20 -Compress | Set-Content -LiteralPath $path -Encoding UTF8
+  Add-AuditLog $Store $User "backup.create" "backup" $fileName $null
+  return [pscustomobject][ordered]@{
+    file = $fileName
+    path = $path
+    created_at = Get-NowIso
+  }
+}
+
+function Get-Backups {
+  if (-not (Test-Path -LiteralPath $BackupDir)) {
+    return @()
+  }
+
+  return @(Get-ChildItem -LiteralPath $BackupDir -Filter "sword-backup-*.json" -File | Sort-Object LastWriteTime -Descending | ForEach-Object {
+    [pscustomobject][ordered]@{
+      file = $_.Name
+      size = $_.Length
+      created_at = $_.LastWriteTime.ToString("o")
+    }
+  })
+}
+
+function Test-LoginRateLimit($Store, [string]$Email, [string]$RemoteKey) {
+  $settings = Get-PublicSettings $Store.settings
+  $key = ("$Email|$RemoteKey").ToLowerInvariant()
+  $now = Get-Date
+  $windowStart = $now.AddMinutes(-[int]$settings.login_rate_limit_window_minutes)
+
+  if (-not $script:LoginAttempts.ContainsKey($key)) {
+    $script:LoginAttempts[$key] = @()
+  }
+
+  $script:LoginAttempts[$key] = @($script:LoginAttempts[$key] | Where-Object { $_ -gt $windowStart })
+  return @($script:LoginAttempts[$key]).Count -lt [int]$settings.login_rate_limit_max_attempts
+}
+
+function Add-LoginFailure($Store, [string]$Email, [string]$RemoteKey) {
+  $key = ("$Email|$RemoteKey").ToLowerInvariant()
+  if (-not $script:LoginAttempts.ContainsKey($key)) {
+    $script:LoginAttempts[$key] = @()
+  }
+  $script:LoginAttempts[$key] = @($script:LoginAttempts[$key]) + (Get-Date)
+}
+
+function Clear-LoginFailures([string]$Email, [string]$RemoteKey) {
+  $key = ("$Email|$RemoteKey").ToLowerInvariant()
+  if ($script:LoginAttempts.ContainsKey($key)) {
+    $script:LoginAttempts.Remove($key)
+  }
+}
+
 function Get-UserBodyError($Body, [bool]$IsCreate) {
   if ($null -eq $Body) {
     return "Corpo da requisicao invalido."
@@ -395,13 +589,34 @@ function Get-UserBodyError($Body, [bool]$IsCreate) {
   }
 
   if ($IsCreate -or $null -ne $Body.password) {
-    if ([string]::IsNullOrWhiteSpace($Body.password) -or "$($Body.password)".Length -lt 8) {
-      return "Senha deve ter pelo menos 8 caracteres."
+    if ([string]::IsNullOrWhiteSpace($Body.password) -or "$($Body.password)".Length -lt 6) {
+      return "Senha deve ter pelo menos 6 caracteres."
     }
   }
 
   if ($null -ne $Body.status -and -not (Test-AllowedValue "$($Body.status)" @("active", "inactive"))) {
     return "Status de usuario invalido."
+  }
+
+  return $null
+}
+
+function Get-SettingsBodyError($Body) {
+  if ($null -eq $Body) {
+    return "Corpo da requisicao invalido."
+  }
+
+  foreach ($field in @("session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms")) {
+    if ($null -ne $Body.$field) {
+      $value = [int]$Body.$field
+      if ($value -lt 1 -or $value -gt 100000) {
+        return "Valor invalido para $field."
+      }
+    }
+  }
+
+  if ($null -ne $Body.app_name -and ("$($Body.app_name)".Trim().Length -lt 1 -or "$($Body.app_name)".Trim().Length -gt 40)) {
+    return "Nome da aplicacao deve ter ate 40 caracteres."
   }
 
   return $null
@@ -423,27 +638,31 @@ function New-UserFromBody($Body, [string]$Now) {
 
 function New-Session($Store, $User, $Request) {
   $token = New-SessionToken
+  $csrfToken = New-CsrfToken
   $now = Get-Date
+  $settings = Get-PublicSettings $Store.settings
   $session = [pscustomobject][ordered]@{
     id = New-EntityId "ses"
     user_id = $User.id
     token_hash = Get-TokenHash $token
+    csrf_token = $csrfToken
     status = "active"
     created_at = $now.ToString("o")
-    expires_at = $now.AddHours(8).ToString("o")
+    expires_at = $now.AddHours([int]$settings.session_hours).ToString("o")
     ip_address = if ($null -eq $Request.RemoteEndPoint) { $null } else { "$($Request.RemoteEndPoint)" }
     user_agent = if ($Request.Headers.ContainsKey("user-agent")) { $Request.Headers["user-agent"] } else { $null }
   }
   $Store.sessions = @(Get-CleanArray $Store.sessions | Where-Object { $_.status -eq "active" -and [datetime]::Parse($_.expires_at) -gt $now }) + $session
-  return [pscustomobject]@{ token = $token; session = $session }
+  return [pscustomobject]@{ token = $token; csrf_token = $csrfToken; session = $session }
 }
 
-function Get-SessionCookieHeader([string]$Token) {
-  return "Set-Cookie: monitor_session=$Token; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800"
+function Get-SessionCookieHeader([string]$Token, [int]$Hours = 8) {
+  $maxAge = [math]::Max(60, $Hours * 3600)
+  return "Set-Cookie: sword_session=$Token; HttpOnly; SameSite=Strict; Path=/; Max-Age=$maxAge"
 }
 
 function Get-ClearSessionCookieHeader {
-  return "Set-Cookie: monitor_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+  return "Set-Cookie: sword_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
 }
 
 function Get-DeviceBodyError($Body, [bool]$IsCreate) {
@@ -576,7 +795,8 @@ function Invoke-DeviceCheck($Store, $Device) {
   }
 
   $now = Get-NowIso
-  $isOnline = Test-HostOnline $Device.host $Attempts $TimeoutMs
+  $settings = Get-PublicSettings $Store.settings
+  $isOnline = Test-HostOnline $Device.host ([int]$settings.check_attempts) ([int]$settings.check_timeout_ms)
   Apply-DeviceStatus $Store $Device $isOnline $now
 
   return [pscustomobject]@{
@@ -670,11 +890,14 @@ function Handle-ApiRequest($Context) {
 
     if ($method -eq "GET" -and $path -eq "/api/auth/status") {
       $currentUser = Get-CurrentUser $store $request
+      $currentSession = Get-CurrentSession $store $request
       Save-Store $store
       Send-Json $Context ([pscustomobject]@{
         setup_required = @(Get-CleanArray $store.users).Count -eq 0
         authenticated = $null -ne $currentUser
         user = Get-PublicUser $currentUser
+        csrf_token = if ($null -eq $currentSession) { $null } else { $currentSession.csrf_token }
+        settings = Get-PublicSettings $store.settings
         roles = @(
           [pscustomobject]@{ value = "admin"; label = "Administrador" },
           [pscustomobject]@{ value = "operator"; label = "Operador" },
@@ -709,7 +932,7 @@ function Handle-ApiRequest($Context) {
       $user.last_login_at = $now
       Add-AuditLog $store $user "auth.setup" "user" $user.id ([pscustomobject]@{ role = $user.role })
       Save-Store $store
-      Send-Json $Context ([pscustomobject]@{ ok = $true; user = Get-PublicUser $user }) 201 @((Get-SessionCookieHeader $sessionResult.token))
+      Send-Json $Context ([pscustomobject]@{ ok = $true; user = Get-PublicUser $user; csrf_token = $sessionResult.csrf_token }) 201 @((Get-SessionCookieHeader $sessionResult.token ([int]$store.settings.session_hours)))
       return
     }
 
@@ -720,18 +943,30 @@ function Handle-ApiRequest($Context) {
         return
       }
 
+      $remoteKey = if ($null -eq $request.RemoteEndPoint) { "local" } else { "$($request.RemoteEndPoint)" }
+      if (-not (Test-LoginRateLimit $store "$($body.email)" $remoteKey)) {
+        Add-AuditLog $store $null "auth.login.rate_limited" "user" "$($body.email)" ([pscustomobject]@{ remote = $remoteKey })
+        Save-Store $store
+        Send-Json $Context ([pscustomobject]@{ error = "Muitas tentativas. Aguarde antes de tentar novamente." }) 429
+        return
+      }
+
       $user = Get-UserByEmail $store "$($body.email)"
       if ($null -eq $user -or $user.status -ne "active" -or -not (Test-PasswordHash "$($body.password)" "$($user.password_hash)")) {
+        Add-LoginFailure $store "$($body.email)" $remoteKey
+        Add-AuditLog $store $null "auth.login.failed" "user" "$($body.email)" ([pscustomobject]@{ remote = $remoteKey })
+        Save-Store $store
         Send-Json $Context ([pscustomobject]@{ error = "Email ou senha invalidos." }) 401
         return
       }
 
+      Clear-LoginFailures "$($body.email)" $remoteKey
       $sessionResult = New-Session $store $user $request
       $user.last_login_at = Get-NowIso
       $user.updated_at = Get-NowIso
       Add-AuditLog $store $user "auth.login" "user" $user.id $null
       Save-Store $store
-      Send-Json $Context ([pscustomobject]@{ ok = $true; user = Get-PublicUser $user }) 200 @((Get-SessionCookieHeader $sessionResult.token))
+      Send-Json $Context ([pscustomobject]@{ ok = $true; user = Get-PublicUser $user; csrf_token = $sessionResult.csrf_token }) 200 @((Get-SessionCookieHeader $sessionResult.token ([int]$store.settings.session_hours)))
       return
     }
 
@@ -757,8 +992,117 @@ function Handle-ApiRequest($Context) {
       return
     }
 
+    if (-not (Test-Csrf $store $request)) {
+      Add-AuditLog $store $currentUser "security.csrf.blocked" "request" $path ([pscustomobject]@{ method = $method })
+      Save-Store $store
+      Send-Json $Context ([pscustomobject]@{ error = "Token de seguranca invalido. Atualize a pagina e tente novamente." }) 403
+      return
+    }
+
     if ($method -eq "GET" -and $path -eq "/api/auth/me") {
-      Send-Json $Context ([pscustomobject]@{ user = Get-PublicUser $currentUser })
+      $currentSession = Get-CurrentSession $store $request
+      Send-Json $Context ([pscustomobject]@{ user = Get-PublicUser $currentUser; csrf_token = if ($null -eq $currentSession) { $null } else { $currentSession.csrf_token } })
+      return
+    }
+
+    if ($method -eq "PUT" -and $path -eq "/api/auth/password") {
+      $body = Read-RequestJson $request
+      if ($null -eq $body -or [string]::IsNullOrWhiteSpace($body.current_password) -or [string]::IsNullOrWhiteSpace($body.new_password)) {
+        Send-Json $Context ([pscustomobject]@{ error = "Informe senha atual e nova senha." }) 400
+        return
+      }
+      if ("$($body.new_password)".Length -lt 6) {
+        Send-Json $Context ([pscustomobject]@{ error = "A nova senha deve ter pelo menos 6 caracteres." }) 400
+        return
+      }
+      if (-not (Test-PasswordHash "$($body.current_password)" "$($currentUser.password_hash)")) {
+        Send-Json $Context ([pscustomobject]@{ error = "Senha atual invalida." }) 401
+        return
+      }
+
+      $currentUser.password_hash = Get-PasswordHash "$($body.new_password)"
+      $currentUser.updated_at = Get-NowIso
+      Add-AuditLog $store $currentUser "auth.password.change" "user" $currentUser.id $null
+      Save-Store $store
+      Send-Json $Context ([pscustomobject]@{ ok = $true })
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/settings") {
+      Send-Json $Context (Get-PublicSettings $store.settings)
+      return
+    }
+
+    if ($method -eq "PUT" -and $path -eq "/api/settings") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem alterar configuracoes." }) 403
+        return
+      }
+
+      $body = Read-RequestJson $request
+      $settingsError = Get-SettingsBodyError $body
+      if ($null -ne $settingsError) {
+        Send-Json $Context ([pscustomobject]@{ error = $settingsError }) 400
+        return
+      }
+
+      foreach ($field in @("app_name", "session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms", "require_csrf", "allow_viewer_export")) {
+        if ($null -ne $body.$field) {
+          $store.settings.$field = $body.$field
+        }
+      }
+      $store.settings.security_mode = "hardened-local"
+      $store.settings.updated_at = Get-NowIso
+      Invoke-RetentionCleanup $store
+      Add-AuditLog $store $currentUser "settings.update" "settings" "system" (Get-PublicSettings $store.settings)
+      Save-Store $store
+      Send-Json $Context (Get-PublicSettings $store.settings)
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/audit") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem ver auditoria." }) 403
+        return
+      }
+      Send-JsonArray $Context (Get-AuditRows $store)
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/backups") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem listar backups." }) 403
+        return
+      }
+      Send-JsonArray $Context (Get-Backups)
+      return
+    }
+
+    if ($method -eq "POST" -and $path -eq "/api/backups") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem criar backups." }) 403
+        return
+      }
+      $backup = New-Backup $store $currentUser
+      Save-Store $store
+      Send-Json $Context $backup 201
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/export") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator")) -and $store.settings.allow_viewer_export -ne $true) {
+        Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite exportar dados." }) 403
+        return
+      }
+      Add-AuditLog $store $currentUser "data.export" "store" "json" $null
+      Save-Store $store
+      Send-Json $Context ([pscustomobject]@{
+        exported_at = Get-NowIso
+        exported_by = Get-PublicUser $currentUser
+        devices = $store.devices
+        status_events = $store.status_events
+        alerts = $store.alerts
+      })
       return
     }
 
@@ -1075,6 +1419,9 @@ function Read-TcpHttpContext($Client) {
   if ($headers.ContainsKey("content-length")) {
     [int]::TryParse($headers["content-length"], [ref]$contentLength) | Out-Null
   }
+  if ($contentLength -gt 1048576) {
+    throw "Corpo da requisicao excede 1 MB."
+  }
 
   $bodyStart = $headerEnd + 4
   while (($data.Length - $bodyStart) -lt $contentLength) {
@@ -1133,7 +1480,8 @@ try {
       } catch {
         Write-Warning "Falha no ciclo de monitoramento: $($_.Exception.Message)"
       }
-      $nextCheck = (Get-Date).AddSeconds($CheckIntervalSeconds)
+      $cycleSettings = Get-PublicSettings (Read-Store).settings
+      $nextCheck = (Get-Date).AddSeconds([int]$cycleSettings.check_interval_seconds)
     }
 
     $clientTask = $listener.AcceptTcpClientAsync()
@@ -1146,7 +1494,8 @@ try {
         } catch {
           Write-Warning "Falha no ciclo de monitoramento: $($_.Exception.Message)"
         }
-        $nextCheck = (Get-Date).AddSeconds($CheckIntervalSeconds)
+        $cycleSettings = Get-PublicSettings (Read-Store).settings
+        $nextCheck = (Get-Date).AddSeconds([int]$cycleSettings.check_interval_seconds)
       }
     }
 

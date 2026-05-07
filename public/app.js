@@ -8,13 +8,17 @@
       checked: false,
       setupRequired: false,
       user: null,
-      roles: []
+      roles: [],
+      csrfToken: ""
     },
+    settings: null,
     summary: null,
     devices: [],
     events: [],
     alerts: [],
     users: [],
+    audit: [],
+    backups: [],
     filters: {
       search: "",
       status: "all",
@@ -27,8 +31,30 @@
       criticality: "all"
     },
     modal: null,
-    userModal: null
+    userModal: null,
+    passwordModal: null
   };
+
+  const DEVICE_TYPES = [
+    "Computador",
+    "Notebook",
+    "Servidor",
+    "Banco de Dados",
+    "Firewall",
+    "Switch",
+    "Roteador",
+    "Access Point",
+    "Impressora",
+    "Storage/NAS",
+    "Virtualizador",
+    "Camera IP",
+    "Telefone IP",
+    "Nobreak/UPS",
+    "Sensor IoT",
+    "Gateway",
+    "Servico",
+    "Outro"
+  ];
 
   const app = document.getElementById("app");
   const api = {
@@ -39,11 +65,16 @@
   };
 
   function request(url, options = {}) {
+    const method = options.method || "GET";
     const init = {
-      method: options.method || "GET",
+      method,
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin"
     };
+
+    if (state.auth.csrfToken && !["GET", "HEAD", "OPTIONS"].includes(method)) {
+      init.headers["X-CSRF-Token"] = state.auth.csrfToken;
+    }
 
     if (options.body) {
       init.body = JSON.stringify(options.body);
@@ -88,6 +119,25 @@
       viewer: "Visualizador"
     };
     return map[role] || role || "-";
+  }
+
+  function asSettings(value) {
+    return {
+      app_name: value?.app_name || "Sword",
+      security_mode: value?.security_mode || "hardened-local",
+      session_hours: Number(value?.session_hours || 8),
+      login_rate_limit_window_minutes: Number(value?.login_rate_limit_window_minutes || 15),
+      login_rate_limit_max_attempts: Number(value?.login_rate_limit_max_attempts || 5),
+      audit_retention_days: Number(value?.audit_retention_days || 180),
+      event_retention_days: Number(value?.event_retention_days || 365),
+      backup_retention_days: Number(value?.backup_retention_days || 30),
+      check_interval_seconds: Number(value?.check_interval_seconds || 30),
+      check_attempts: Number(value?.check_attempts || 3),
+      check_timeout_ms: Number(value?.check_timeout_ms || 900),
+      require_csrf: value?.require_csrf !== false,
+      allow_viewer_export: Boolean(value?.allow_viewer_export),
+      updated_at: value?.updated_at || new Date().toISOString()
+    };
   }
 
   function asArray(value) {
@@ -251,6 +301,9 @@
       state.devices = asArray(devices);
       state.events = asArray(events);
       state.alerts = asArray(alerts);
+      if (!state.settings) {
+        state.settings = asSettings(await api.get("/api/settings"));
+      }
       state.error = "";
     } catch (error) {
       state.error = error.message;
@@ -277,6 +330,8 @@
       state.auth.setupRequired = Boolean(status?.setup_required);
       state.auth.user = status?.authenticated ? status.user : null;
       state.auth.roles = asArray(status?.roles);
+      state.auth.csrfToken = status?.csrf_token || "";
+      state.settings = asSettings(status?.settings);
       if (state.auth.user) {
         await loadData({ silent: true });
       } else {
@@ -300,13 +355,31 @@
     state.users = asArray(await api.get("/api/users"));
   }
 
+  async function loadAudit() {
+    if (!isAdmin()) {
+      state.audit = [];
+      return;
+    }
+
+    state.audit = asArray(await api.get("/api/audit"));
+  }
+
+  async function loadSecurityData() {
+    state.settings = asSettings(await api.get("/api/settings"));
+    if (isAdmin()) {
+      state.backups = asArray(await api.get("/api/backups"));
+    }
+  }
+
   function pageTitle() {
     const map = {
       dashboard: ["Dashboard", "Visao geral da infraestrutura"],
       devices: ["Dispositivos", "Cadastro e operacao dos ativos monitorados"],
       alerts: ["Alertas", "Ocorrencias criticas em aberto"],
       history: ["Historico", "Eventos de disponibilidade e indisponibilidade"],
-      users: ["Usuarios", "Controle de acesso e cargos"]
+      users: ["Usuarios", "Controle de acesso e cargos"],
+      audit: ["Auditoria", "Rastro de seguranca e operacao"],
+      security: ["Seguranca", "Configuracoes, backup e protecoes do Sword"]
     };
     return map[state.view] || map.dashboard;
   }
@@ -344,6 +417,7 @@
                 <div class="live-pill"><span class="live-dot"></span>Monitoramento ativo</div>
                 <div class="timestamp">Atualizado: ${state.summary ? timeAgo(state.summary.generated_at) : "-"}</div>
                 ${canOperate() ? `<button class="button" data-action="run-monitor">Verificar agora</button>` : ""}
+                <button class="button" data-action="open-password-modal">Senha</button>
                 <div class="user-chip">
                   <div class="avatar">${escapeHtml(getInitials(state.auth.user.name))}</div>
                   <div>
@@ -362,6 +436,7 @@
           </main>
           ${state.modal ? renderModal() : ""}
           ${state.userModal ? renderUserModal() : ""}
+          ${state.passwordModal ? renderPasswordModal() : ""}
           ${state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : ""}
         </div>
       `;
@@ -393,14 +468,41 @@
       .toUpperCase() || "U";
   }
 
+  function swordLogo() {
+    return `
+      <svg viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+        <path d="M32 4l7 8-5 9v19l12-12 8 8-15 11 3 6-10 7-10-7 3-6-15-11 8-8 12 12V21l-5-9 7-8z" fill="currentColor" opacity=".16"></path>
+        <path d="M32 5l5 8-4 8v27l5 8-6 4-6-4 5-8V21l-4-8 5-8z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"></path>
+        <path d="M15 32l12 8h10l12-8" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"></path>
+      </svg>
+    `;
+  }
+
+  function deviceIcon(type) {
+    const key = String(type || "Outro").toLowerCase();
+    let shape = `<rect x="10" y="16" width="44" height="30" rx="4"></rect><path d="M24 54h16M29 46v8M35 46v8"></path>`;
+    if (key.includes("servidor")) shape = `<rect x="18" y="8" width="28" height="48" rx="4"></rect><path d="M24 18h16M24 30h16M24 42h16"></path><circle cx="39" cy="50" r="2"></circle>`;
+    if (key.includes("banco")) shape = `<ellipse cx="32" cy="14" rx="18" ry="7"></ellipse><path d="M14 14v30c0 4 8 7 18 7s18-3 18-7V14"></path><path d="M14 29c0 4 8 7 18 7s18-3 18-7"></path>`;
+    if (key.includes("firewall")) shape = `<path d="M12 18h40v30H12z"></path><path d="M12 28h40M22 18v10M34 18v10M46 28v10M12 38h40M28 38v10M40 38v10"></path>`;
+    if (key.includes("switch") || key.includes("roteador")) shape = `<rect x="10" y="24" width="44" height="20" rx="4"></rect><circle cx="19" cy="34" r="2"></circle><circle cx="27" cy="34" r="2"></circle><circle cx="35" cy="34" r="2"></circle><path d="M44 31l6 6M50 31l-6 6"></path>`;
+    if (key.includes("access")) shape = `<circle cx="32" cy="42" r="4"></circle><path d="M18 30a20 20 0 0128 0M24 36a11 11 0 0116 0M12 24a29 29 0 0140 0"></path>`;
+    if (key.includes("impressora")) shape = `<path d="M18 24V10h28v14"></path><rect x="12" y="24" width="40" height="22" rx="4"></rect><path d="M20 42h24v12H20zM20 18h24"></path>`;
+    if (key.includes("notebook")) shape = `<rect x="14" y="14" width="36" height="28" rx="3"></rect><path d="M8 50h48l-6-8H14z"></path>`;
+    if (key.includes("camera")) shape = `<rect x="14" y="22" width="28" height="18" rx="4"></rect><path d="M42 28l10-6v18l-10-6z"></path><circle cx="28" cy="31" r="5"></circle>`;
+    if (key.includes("telefone") || key.includes("celular")) shape = `<rect x="22" y="8" width="20" height="48" rx="5"></rect><path d="M29 48h6"></path>`;
+    if (key.includes("storage") || key.includes("nas")) shape = `<rect x="14" y="10" width="36" height="44" rx="4"></rect><path d="M20 22h24M20 34h24M20 46h24"></path><circle cx="41" cy="17" r="2"></circle>`;
+    if (key.includes("nobreak") || key.includes("ups")) shape = `<rect x="18" y="10" width="28" height="44" rx="4"></rect><path d="M32 18l-6 14h7l-3 14 8-18h-7z"></path>`;
+    return `<span class="equipment-icon"><svg viewBox="0 0 64 64" aria-hidden="true" focusable="false">${shape}</svg></span>`;
+  }
+
   function renderAuthShell(title, subtitle, formHtml) {
     return `
       <div class="auth-screen">
         <section class="auth-panel">
           <div class="auth-brand">
-            <div class="brand-mark">MI</div>
+            <div class="brand-mark sword-mark">${swordLogo()}</div>
             <div>
-              <div class="brand-title">Monitoramento</div>
+              <div class="brand-title">Sword</div>
               <div class="brand-subtitle">Acesso seguro ao painel</div>
             </div>
           </div>
@@ -421,7 +523,7 @@
         <form class="auth-form" id="setup-form">
           <label>Nome<input class="input" name="name" required autocomplete="name"></label>
           <label>Email<input class="input" name="email" required type="email" autocomplete="email"></label>
-          <label>Senha<input class="input" name="password" required type="password" minlength="8" autocomplete="new-password"></label>
+          <label>Senha<input class="input" name="password" required type="password" minlength="6" autocomplete="new-password"></label>
           <button class="button primary" type="submit">Criar administrador</button>
         </form>
       `
@@ -456,19 +558,21 @@
       ["dashboard", "DB", "Dashboard"],
       ["devices", "DV", "Dispositivos"],
       ["alerts", "AL", "Alertas"],
-      ["history", "EV", "Historico"]
+      ["history", "EV", "Historico"],
+      ["security", "SC", "Seguranca"]
     ];
     if (isAdmin()) {
       items.push(["users", "US", "Usuarios"]);
+      items.push(["audit", "AU", "Auditoria"]);
     }
 
     return `
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-mark">MI</div>
+          <div class="brand-mark sword-mark">${swordLogo()}</div>
           <div>
-            <div class="brand-title">Monitoramento</div>
-            <div class="brand-subtitle">Infraestrutura operacional</div>
+            <div class="brand-title">Sword</div>
+            <div class="brand-subtitle">Infraestrutura protegida</div>
           </div>
         </div>
         <nav class="nav">
@@ -500,6 +604,8 @@
     if (state.view === "alerts") return renderAlertsPage();
     if (state.view === "history") return renderHistoryPage();
     if (state.view === "users") return renderUsersPage();
+    if (state.view === "audit") return renderAuditPage();
+    if (state.view === "security") return renderSecurityPage();
     return renderDashboard();
   }
 
@@ -594,7 +700,7 @@
   }
 
   function renderFilters() {
-    const types = [...new Set(asArray(state.devices).map((device) => device.type).filter(Boolean))].sort();
+    const types = [...new Set(DEVICE_TYPES.concat(asArray(state.devices).map((device) => device.type).filter(Boolean)))].sort();
     return `
       <div class="filters">
         <input class="input" data-filter="search" placeholder="Buscar dispositivo..." value="${escapeHtml(state.filters.search)}">
@@ -660,6 +766,7 @@
         <td>
           <div class="device-name">
             <span class="status-dot ${device.current_status}"></span>
+            ${deviceIcon(device.type)}
             ${escapeHtml(device.name)}
           </div>
         </td>
@@ -914,11 +1021,114 @@
     `;
   }
 
+  function renderAuditPage() {
+    if (!isAdmin()) {
+      return `<section class="panel">Apenas administradores podem acessar auditoria.</section>`;
+    }
+
+    return `
+      <section class="table-panel">
+        <div class="section-header" style="padding: 18px 18px 0;">
+          <h2 class="section-title">Auditoria de seguranca</h2>
+          <button class="button" data-action="refresh-audit">Atualizar</button>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Data</th>
+                <th>Usuario</th>
+                <th>Acao</th>
+                <th>Entidade</th>
+                <th>ID</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${asArray(state.audit).map((row) => `
+                <tr>
+                  <td>${formatDate(row.created_at)}</td>
+                  <td>${escapeHtml(row.user_name || "Sistema")}</td>
+                  <td><span class="badge inactive">${escapeHtml(row.action)}</span></td>
+                  <td>${escapeHtml(row.entity_type || "-")}</td>
+                  <td>${escapeHtml(row.entity_id || "-")}</td>
+                </tr>
+              `).join("") || `<tr><td colspan="5"><div class="empty-state">Nenhum evento de auditoria encontrado.</div></td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderSecurityPage() {
+    const settings = asSettings(state.settings);
+    return `
+      <div class="dashboard-grid">
+        <section class="panel">
+          <div class="section-header">
+            <h2 class="section-title">Postura de seguranca</h2>
+            <span class="badge online">HARDENED LOCAL</span>
+          </div>
+          <div class="security-grid">
+            <div class="security-item"><strong>CSRF</strong><span>${settings.require_csrf ? "Ativo" : "Inativo"}</span></div>
+            <div class="security-item"><strong>Sessao</strong><span>${settings.session_hours}h</span></div>
+            <div class="security-item"><strong>Rate limit</strong><span>${settings.login_rate_limit_max_attempts} tentativas / ${settings.login_rate_limit_window_minutes}min</span></div>
+            <div class="security-item"><strong>Auditoria</strong><span>${settings.audit_retention_days} dias</span></div>
+          </div>
+          <div class="empty-state security-note">Para producao, execute atras de HTTPS/reverse proxy e proteja o arquivo de dados e backups no sistema operacional.</div>
+        </section>
+        <section class="panel">
+          <div class="section-header">
+            <h2 class="section-title">Backups</h2>
+            ${isAdmin() ? `<button class="button primary" data-action="create-backup">Criar backup</button>` : ""}
+          </div>
+          <div class="alert-list">
+            ${asArray(state.backups).slice(0, 6).map((backup) => `
+              <article class="mini-panel">
+                <div class="mini-title">${escapeHtml(backup.file)}</div>
+                <div class="mini-text">${formatDate(backup.created_at)} - ${Math.round(Number(backup.size || 0) / 1024)} KB</div>
+              </article>
+            `).join("") || `<div class="empty-state">Nenhum backup criado nesta versao.</div>`}
+          </div>
+        </section>
+      </div>
+      ${isAdmin() ? renderSettingsForm(settings) : ""}
+    `;
+  }
+
+  function renderSettingsForm(settings) {
+    return `
+      <section class="panel">
+        <div class="section-header">
+          <h2 class="section-title">Configuracoes do Sword</h2>
+          <button class="button" data-action="export-data">Exportar dados</button>
+        </div>
+        <form class="form-grid" id="settings-form">
+          <div class="field"><label>Nome da aplicacao</label><input class="input" name="app_name" value="${escapeHtml(settings.app_name)}"></div>
+          <div class="field"><label>Sessao (horas)</label><input class="input" name="session_hours" type="number" min="1" value="${settings.session_hours}"></div>
+          <div class="field"><label>Tentativas de login</label><input class="input" name="login_rate_limit_max_attempts" type="number" min="1" value="${settings.login_rate_limit_max_attempts}"></div>
+          <div class="field"><label>Janela do rate limit (min)</label><input class="input" name="login_rate_limit_window_minutes" type="number" min="1" value="${settings.login_rate_limit_window_minutes}"></div>
+          <div class="field"><label>Intervalo de checagem (s)</label><input class="input" name="check_interval_seconds" type="number" min="1" value="${settings.check_interval_seconds}"></div>
+          <div class="field"><label>Tentativas por dispositivo</label><input class="input" name="check_attempts" type="number" min="1" value="${settings.check_attempts}"></div>
+          <div class="field"><label>Timeout de ping (ms)</label><input class="input" name="check_timeout_ms" type="number" min="50" value="${settings.check_timeout_ms}"></div>
+          <div class="field"><label>Retencao de auditoria (dias)</label><input class="input" name="audit_retention_days" type="number" min="1" value="${settings.audit_retention_days}"></div>
+          <div class="field"><label>Retencao de eventos (dias)</label><input class="input" name="event_retention_days" type="number" min="1" value="${settings.event_retention_days}"></div>
+          <div class="field"><label>Retencao de backup (dias)</label><input class="input" name="backup_retention_days" type="number" min="1" value="${settings.backup_retention_days}"></div>
+          <div class="field full">
+            <label class="checkbox-field"><input type="checkbox" name="require_csrf" ${settings.require_csrf ? "checked" : ""}> Exigir token anti-CSRF nas acoes de escrita</label>
+            <label class="checkbox-field"><input type="checkbox" name="allow_viewer_export" ${settings.allow_viewer_export ? "checked" : ""}> Permitir exportacao para visualizadores</label>
+          </div>
+          <div class="field full"><button class="button primary" type="submit">Salvar configuracoes</button></div>
+        </form>
+      </section>
+    `;
+  }
+
   function renderModal() {
     const device = state.modal.device || {
       name: "",
       host: "",
-      type: "Servidor",
+      type: "Computador",
       location: "",
       criticality: "media",
       is_active: true
@@ -945,7 +1155,7 @@
             <div class="field">
               <label for="type">Tipo</label>
               <select class="select" id="type" name="type">
-                ${["Servidor", "Banco de Dados", "Firewall", "Switch", "Impressora", "Access Point", "Servico", "Outro"].map((type) => `<option value="${type}"${device.type === type ? " selected" : ""}>${type}</option>`).join("")}
+                ${DEVICE_TYPES.map((type) => `<option value="${type}"${device.type === type ? " selected" : ""}>${type}</option>`).join("")}
               </select>
             </div>
             <div class="field">
@@ -1020,13 +1230,41 @@
             </div>
             <div class="field full">
               <label for="user-password">${isEdit ? "Nova senha" : "Senha"}</label>
-              <input class="input" id="user-password" name="password" type="password" ${isEdit ? "" : "required"} minlength="8" autocomplete="new-password">
-              <div class="field-help">${isEdit ? "Deixe em branco para manter a senha atual." : "Minimo de 8 caracteres."}</div>
+              <input class="input" id="user-password" name="password" type="password" ${isEdit ? "" : "required"} minlength="6" autocomplete="new-password">
+              <div class="field-help">${isEdit ? "Deixe em branco para manter a senha atual." : "Minimo de 6 caracteres."}</div>
             </div>
           </div>
           <div class="modal-footer">
             <button class="button" type="button" data-action="close-user-modal">Cancelar</button>
             <button class="button primary" type="submit">${isEdit ? "Salvar usuario" : "Criar usuario"}</button>
+          </div>
+        </form>
+      </div>
+    `;
+  }
+
+  function renderPasswordModal() {
+    return `
+      <div class="modal-backdrop">
+        <form class="modal" id="password-form">
+          <div class="modal-header">
+            <h2 class="section-title">Alterar senha</h2>
+            <button class="button icon-only" type="button" data-action="close-password-modal">X</button>
+          </div>
+          <div class="form-grid">
+            <div class="field full">
+              <label>Senha atual</label>
+              <input class="input" name="current_password" type="password" required autocomplete="current-password">
+            </div>
+            <div class="field full">
+              <label>Nova senha</label>
+              <input class="input" name="new_password" type="password" required minlength="6" autocomplete="new-password">
+              <div class="field-help">Mantive o limite simples como voce pediu; ainda recomendamos senhas fortes em ambiente real.</div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="button" type="button" data-action="close-password-modal">Cancelar</button>
+            <button class="button primary" type="submit">Atualizar senha</button>
           </div>
         </form>
       </div>
@@ -1040,6 +1278,20 @@
         if (state.view === "users") {
           try {
             await loadUsers();
+          } catch (error) {
+            setToast(error.message);
+          }
+        }
+        if (state.view === "audit") {
+          try {
+            await loadAudit();
+          } catch (error) {
+            setToast(error.message);
+          }
+        }
+        if (state.view === "security") {
+          try {
+            await loadSecurityData();
           } catch (error) {
             setToast(error.message);
           }
@@ -1079,6 +1331,16 @@
     if (userForm) {
       userForm.addEventListener("submit", handleUserSubmit);
     }
+
+    const settingsForm = app.querySelector("#settings-form");
+    if (settingsForm) {
+      settingsForm.addEventListener("submit", handleSettingsSubmit);
+    }
+
+    const passwordForm = app.querySelector("#password-form");
+    if (passwordForm) {
+      passwordForm.addEventListener("submit", handlePasswordSubmit);
+    }
   }
 
   async function handleAction(event) {
@@ -1091,9 +1353,20 @@
         return;
       }
 
+      if (action === "open-password-modal") {
+        state.passwordModal = {};
+        render();
+      }
+
+      if (action === "close-password-modal") {
+        state.passwordModal = null;
+        render();
+      }
+
       if (action === "logout") {
         await api.post("/api/auth/logout");
         state.auth.user = null;
+        state.auth.csrfToken = "";
         state.auth.setupRequired = false;
         state.view = "dashboard";
         state.devices = [];
@@ -1102,6 +1375,31 @@
         state.users = [];
         render();
         return;
+      }
+
+      if (action === "refresh-audit") {
+        await loadAudit();
+        setToast("Auditoria atualizada.");
+        render();
+      }
+
+      if (action === "create-backup") {
+        await api.post("/api/backups");
+        await loadSecurityData();
+        setToast("Backup criado.");
+        render();
+      }
+
+      if (action === "export-data") {
+        const exported = await api.get("/api/export");
+        const blob = new Blob([JSON.stringify(exported, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `sword-export-${new Date().toISOString().slice(0, 10)}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+        setToast("Exportacao preparada.");
       }
 
       if (action === "new-user") {
@@ -1194,6 +1492,7 @@
       state.error = "";
       const response = await api.post("/api/auth/setup", payload);
       state.auth.user = response.user;
+      state.auth.csrfToken = response.csrf_token || "";
       state.auth.setupRequired = false;
       await loadData({ silent: true });
       setToast("Administrador criado.");
@@ -1215,6 +1514,7 @@
       state.error = "";
       const response = await api.post("/api/auth/login", payload);
       state.auth.user = response.user;
+      state.auth.csrfToken = response.csrf_token || "";
       state.auth.setupRequired = false;
       await loadData({ silent: true });
       setToast("Login realizado.");
@@ -1281,6 +1581,52 @@
       }
       state.userModal = null;
       await loadUsers();
+      render();
+    } catch (error) {
+      setToast(error.message);
+    }
+  }
+
+  async function handleSettingsSubmit(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = {
+      app_name: form.get("app_name"),
+      session_hours: Number(form.get("session_hours")),
+      login_rate_limit_max_attempts: Number(form.get("login_rate_limit_max_attempts")),
+      login_rate_limit_window_minutes: Number(form.get("login_rate_limit_window_minutes")),
+      check_interval_seconds: Number(form.get("check_interval_seconds")),
+      check_attempts: Number(form.get("check_attempts")),
+      check_timeout_ms: Number(form.get("check_timeout_ms")),
+      audit_retention_days: Number(form.get("audit_retention_days")),
+      event_retention_days: Number(form.get("event_retention_days")),
+      backup_retention_days: Number(form.get("backup_retention_days")),
+      require_csrf: form.get("require_csrf") === "on",
+      allow_viewer_export: form.get("allow_viewer_export") === "on"
+    };
+
+    try {
+      state.settings = asSettings(await api.put("/api/settings", payload));
+      await loadSecurityData();
+      setToast("Configuracoes salvas.");
+      render();
+    } catch (error) {
+      setToast(error.message);
+    }
+  }
+
+  async function handlePasswordSubmit(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = {
+      current_password: form.get("current_password"),
+      new_password: form.get("new_password")
+    };
+
+    try {
+      await api.put("/api/auth/password", payload);
+      state.passwordModal = null;
+      setToast("Senha alterada.");
       render();
     } catch (error) {
       setToast(error.message);

@@ -16,5 +16,21 @@
                  ],
     "audit_logs":  [
 
-                   ]
+                   ],
+    "settings":  {
+                     "app_name":  "Sword",
+                     "security_mode":  "hardened-local",
+                     "session_hours":  8,
+                     "login_rate_limit_window_minutes":  15,
+                     "login_rate_limit_max_attempts":  5,
+                     "audit_retention_days":  180,
+                     "event_retention_days":  365,
+                     "backup_retention_days":  30,
+                     "check_interval_seconds":  30,
+                     "check_attempts":  3,
+                     "check_timeout_ms":  900,
+                     "require_csrf":  true,
+                     "allow_viewer_export":  false,
+                     "updated_at":  null
+                 }
 }

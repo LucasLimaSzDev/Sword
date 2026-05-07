@@ -145,6 +145,17 @@ button:disabled {
   font-weight: 900;
 }
 
+.sword-mark {
+  color: #1f2937;
+  background: linear-gradient(180deg, #ffffff, #e5e7eb);
+  border-color: #b8c3d1;
+}
+
+.sword-mark svg {
+  width: 30px;
+  height: 30px;
+}
+
 .brand-title {
   font-size: 22px;
   line-height: 1.1;
@@ -539,6 +550,28 @@ th {
   font-weight: 800;
 }
 
+.equipment-icon {
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid #d6deea;
+  border-radius: 7px;
+  color: #46556b;
+  background: #f8fafc;
+}
+
+.equipment-icon svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .status-dot {
   width: 10px;
   height: 10px;
@@ -815,6 +848,35 @@ th {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.35;
+}
+
+.security-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.security-item {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.security-item strong,
+.security-item span {
+  display: block;
+}
+
+.security-item span {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.security-note {
+  margin-top: 14px;
+  text-align: left;
 }
 
 .checkbox-field {

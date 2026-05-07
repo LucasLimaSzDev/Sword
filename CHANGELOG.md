@@ -2,6 +2,16 @@
 
 Todas as versoes publicas do Sword listadas aqui foram criadas por Lucas Lima (LucasLimaSzDev).
 
+## v3.0 - 3.0
+
+Primeira versao com identidade Sword e endurecimento de seguranca.
+
+- Identidade visual Sword.
+- CSRF em acoes de escrita.
+- Rate limit de login.
+- Headers defensivos e politica CSP.
+- Auditoria administrativa, backup manual e exportacao controlada por cargo.
+
 ## v2.0 - 2.0
 
 Evolucao do MVP com autenticacao, usuarios e papeis operacionais.
