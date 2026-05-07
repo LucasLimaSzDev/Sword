@@ -82,8 +82,26 @@ function Read-Store {
   $store | Add-Member -NotePropertyName users -NotePropertyValue @(Get-CleanArray $store.users) -Force
   $store | Add-Member -NotePropertyName sessions -NotePropertyValue @(Get-CleanArray $store.sessions) -Force
   $store | Add-Member -NotePropertyName audit_logs -NotePropertyValue @(Get-CleanArray $store.audit_logs) -Force
+  $store | Add-Member -NotePropertyName integrations -NotePropertyValue @(Get-CleanArray $store.integrations) -Force
+  $store | Add-Member -NotePropertyName integration_deliveries -NotePropertyValue @(Get-CleanArray $store.integration_deliveries) -Force
   if ($null -eq $store.settings) {
     $store | Add-Member -NotePropertyName settings -NotePropertyValue (Get-DefaultSettings) -Force
+  }
+  $defaultSettings = Get-DefaultSettings
+  foreach ($settingName in $defaultSettings.PSObject.Properties.Name) {
+    if ($null -eq $store.settings.$settingName) {
+      $store.settings | Add-Member -NotePropertyName $settingName -NotePropertyValue $defaultSettings.$settingName -Force
+    }
+  }
+  foreach ($device in @(Get-CleanArray $store.devices)) {
+    if ($null -eq $device.check_method) { $device | Add-Member -NotePropertyName check_method -NotePropertyValue "ping" -Force }
+    if ($null -eq $device.port) { $device | Add-Member -NotePropertyName port -NotePropertyValue $null -Force }
+    if ($null -eq $device.url_path) { $device | Add-Member -NotePropertyName url_path -NotePropertyValue "/" -Force }
+    if ($null -eq $device.expected_status) { $device | Add-Member -NotePropertyName expected_status -NotePropertyValue 200 -Force }
+    if ($null -eq $device.owner) { $device | Add-Member -NotePropertyName owner -NotePropertyValue "" -Force }
+    if ($null -eq $device.tags) { $device | Add-Member -NotePropertyName tags -NotePropertyValue "" -Force }
+    if ($null -eq $device.notes) { $device | Add-Member -NotePropertyName notes -NotePropertyValue "" -Force }
+    if ($null -eq $device.maintenance_until) { $device | Add-Member -NotePropertyName maintenance_until -NotePropertyValue $null -Force }
   }
   return $store
 }
@@ -95,6 +113,8 @@ function Save-Store($Store) {
   $Store | Add-Member -NotePropertyName users -NotePropertyValue @(Get-CleanArray $Store.users) -Force
   $Store | Add-Member -NotePropertyName sessions -NotePropertyValue @(Get-CleanArray $Store.sessions) -Force
   $Store | Add-Member -NotePropertyName audit_logs -NotePropertyValue @(Get-CleanArray $Store.audit_logs) -Force
+  $Store | Add-Member -NotePropertyName integrations -NotePropertyValue @(Get-CleanArray $Store.integrations) -Force
+  $Store | Add-Member -NotePropertyName integration_deliveries -NotePropertyValue @(Get-CleanArray $Store.integration_deliveries) -Force
   if ($null -eq $Store.settings) {
     $Store | Add-Member -NotePropertyName settings -NotePropertyValue (Get-DefaultSettings) -Force
   }
@@ -233,6 +253,87 @@ function Test-HostOnline([string]$HostName, [int]$AttemptCount, [int]$PingTimeou
   }
 
   return $false
+}
+
+function Test-TcpOnline([string]$HostName, [int]$Port, [int]$AttemptCount, [int]$TimeoutMs) {
+  if ([string]::IsNullOrWhiteSpace($HostName) -or $Port -lt 1 -or $Port -gt 65535) {
+    return $false
+  }
+
+  for ($i = 0; $i -lt $AttemptCount; $i++) {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+      $task = $client.ConnectAsync($HostName, $Port)
+      if ($task.Wait($TimeoutMs) -and $client.Connected) {
+        return $true
+      }
+    } catch {
+      Start-Sleep -Milliseconds 120
+    } finally {
+      $client.Close()
+    }
+  }
+
+  return $false
+}
+
+function Test-HttpOnline($Device, [int]$AttemptCount, [int]$TimeoutMs, [string]$DefaultScheme = "http") {
+  $hostValue = "$($Device.host)".Trim()
+  if ([string]::IsNullOrWhiteSpace($hostValue)) {
+    return $false
+  }
+
+  $path = if ([string]::IsNullOrWhiteSpace($Device.url_path)) { "/" } else { "$($Device.url_path)" }
+  if (-not $path.StartsWith("/")) { $path = "/$path" }
+  $expected = if ($null -eq $Device.expected_status) { 200 } else { [int]$Device.expected_status }
+  $scheme = if ($DefaultScheme -eq "https") { "https" } else { "http" }
+  $url = if ($hostValue -match "^https?://") { $hostValue } else { "${scheme}://$hostValue" }
+  if ($null -ne $Device.port -and [int]$Device.port -gt 0 -and $url -notmatch ":\d+(/|$)") {
+    $url = "$url`:$($Device.port)"
+  }
+  if ($url -notmatch "/$" -and $path -ne "/") { $url = "$url$path" }
+
+  for ($i = 0; $i -lt $AttemptCount; $i++) {
+    try {
+      $request = [System.Net.HttpWebRequest]::Create($url)
+      $request.Method = "GET"
+      $request.Timeout = $TimeoutMs
+      $request.ReadWriteTimeout = $TimeoutMs
+      $request.AllowAutoRedirect = $false
+      $response = $request.GetResponse()
+      try {
+        $statusCode = [int]$response.StatusCode
+        if ($statusCode -eq $expected) {
+          return $true
+        }
+      } finally {
+        $response.Close()
+      }
+    } catch [System.Net.WebException] {
+      if ($_.Exception.Response) {
+        $statusCode = [int]$_.Exception.Response.StatusCode
+        $_.Exception.Response.Close()
+        if ($statusCode -eq $expected) {
+          return $true
+        }
+      }
+      Start-Sleep -Milliseconds 120
+    } catch {
+      Start-Sleep -Milliseconds 120
+    }
+  }
+
+  return $false
+}
+
+function Test-DeviceOnline($Device, [int]$AttemptCount, [int]$TimeoutMs) {
+  $method = if ([string]::IsNullOrWhiteSpace($Device.check_method)) { "ping" } else { "$($Device.check_method)".ToLowerInvariant() }
+  switch ($method) {
+    "tcp" { return Test-TcpOnline "$($Device.host)" ([int]$Device.port) $AttemptCount $TimeoutMs }
+    "http" { return Test-HttpOnline $Device $AttemptCount $TimeoutMs "http" }
+    "https" { return Test-HttpOnline $Device $AttemptCount $TimeoutMs "https" }
+    default { return Test-HostOnline "$($Device.host)" $AttemptCount $TimeoutMs }
+  }
 }
 
 function Get-OpenEvent($Store, [string]$DeviceId) {
@@ -695,10 +796,57 @@ function Get-DeviceBodyError($Body, [bool]$IsCreate) {
     return "Status atual invalido."
   }
 
-  foreach ($field in @("type", "location")) {
-    if ($null -ne $Body.$field -and "$($Body.$field)".Length -gt 80) {
-      return "Campo $field deve ter ate 80 caracteres."
+  if ($null -ne $Body.check_method -and -not (Test-AllowedValue "$($Body.check_method)" @("ping", "tcp", "http", "https"))) {
+    return "Metodo de verificacao invalido."
+  }
+
+  $method = if ([string]::IsNullOrWhiteSpace($Body.check_method)) { "ping" } else { "$($Body.check_method)".Trim().ToLowerInvariant() }
+  if ($method -eq "tcp" -and ($null -eq $Body.port -or "$($Body.port)" -eq "")) {
+    return "Porta e obrigatoria para verificacao TCP."
+  }
+
+  if ($null -ne $Body.port -and "$($Body.port)" -ne "") {
+    try {
+      $port = [int]$Body.port
+    } catch {
+      return "Porta deve ser numerica."
     }
+    if ($port -lt 1 -or $port -gt 65535) {
+      return "Porta deve estar entre 1 e 65535."
+    }
+  }
+
+  if ($null -ne $Body.expected_status -and "$($Body.expected_status)" -ne "") {
+    try {
+      $status = [int]$Body.expected_status
+    } catch {
+      return "Status HTTP esperado deve ser numerico."
+    }
+    if ($status -lt 100 -or $status -gt 599) {
+      return "Status HTTP esperado deve estar entre 100 e 599."
+    }
+  }
+
+  foreach ($field in @("type", "location", "owner", "tags")) {
+    if ($null -ne $Body.$field -and "$($Body.$field)".Length -gt 120) {
+      return "Campo $field deve ter ate 120 caracteres."
+    }
+  }
+
+  if ($null -ne $Body.url_path -and "$($Body.url_path)".Length -gt 160) {
+    return "Caminho HTTP deve ter ate 160 caracteres."
+  }
+
+  if ($null -ne $Body.maintenance_until -and -not [string]::IsNullOrWhiteSpace($Body.maintenance_until)) {
+    try {
+      [datetime]::Parse("$($Body.maintenance_until)") | Out-Null
+    } catch {
+      return "Data de manutencao invalida."
+    }
+  }
+
+  if ($null -ne $Body.notes -and "$($Body.notes)".Length -gt 500) {
+    return "Observacoes devem ter ate 500 caracteres."
   }
 
   return $null
@@ -742,6 +890,57 @@ function New-CriticalAlert($Store, $Device, $Event, [string]$Now) {
   }
 
   $Store.alerts = @(Get-CleanArray $Store.alerts) + $alert
+  Invoke-AlertIntegrations $Store $Device $Event $alert
+}
+
+function Invoke-AlertIntegrations($Store, $Device, $Event, $Alert) {
+  foreach ($integration in @(Get-CleanArray $Store.integrations | Where-Object { $_.enabled -eq $true -and $_.type -eq "webhook" })) {
+    $delivery = [pscustomobject][ordered]@{
+      id = New-EntityId "del"
+      integration_id = $integration.id
+      alert_id = $Alert.id
+      status = "pending"
+      status_code = $null
+      error = $null
+      created_at = Get-NowIso
+    }
+
+    try {
+      $payload = [pscustomobject][ordered]@{
+        source = "Sword"
+        event = "alert.created"
+        alert = $Alert
+        device = $Device
+        status_event = $Event
+        sent_at = Get-NowIso
+      } | ConvertTo-Json -Depth 12 -Compress
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+      $request = [System.Net.HttpWebRequest]::Create("$($integration.url)")
+      $request.Method = "POST"
+      $request.ContentType = "application/json"
+      $request.Timeout = 2500
+      $request.ReadWriteTimeout = 2500
+      if (-not [string]::IsNullOrWhiteSpace($integration.secret)) {
+        $request.Headers.Add("X-Sword-Secret", "$($integration.secret)")
+      }
+      $request.ContentLength = $bytes.Length
+      $stream = $request.GetRequestStream()
+      $stream.Write($bytes, 0, $bytes.Length)
+      $stream.Close()
+      $response = $request.GetResponse()
+      try {
+        $delivery.status = "delivered"
+        $delivery.status_code = [int]$response.StatusCode
+      } finally {
+        $response.Close()
+      }
+    } catch {
+      $delivery.status = "failed"
+      $delivery.error = $_.Exception.Message
+    }
+
+    $Store.integration_deliveries = @(Get-CleanArray $Store.integration_deliveries) + $delivery
+  }
 }
 
 function Resolve-EventAndAlerts($Store, $Device, [string]$Now) {
@@ -794,15 +993,30 @@ function Invoke-DeviceCheck($Store, $Device) {
     }
   }
 
+  if (-not [string]::IsNullOrWhiteSpace($Device.maintenance_until)) {
+    try {
+      if ([datetime]::Parse($Device.maintenance_until) -gt (Get-Date)) {
+        return [pscustomobject]@{
+          device_id = $Device.id
+          checked = $false
+          reason = "maintenance"
+          status = $Device.current_status
+          maintenance_until = $Device.maintenance_until
+        }
+      }
+    } catch {}
+  }
+
   $now = Get-NowIso
   $settings = Get-PublicSettings $Store.settings
-  $isOnline = Test-HostOnline $Device.host ([int]$settings.check_attempts) ([int]$settings.check_timeout_ms)
+  $isOnline = Test-DeviceOnline $Device ([int]$settings.check_attempts) ([int]$settings.check_timeout_ms)
   Apply-DeviceStatus $Store $Device $isOnline $now
 
   return [pscustomobject]@{
     device_id = $Device.id
     checked = $true
     status = $Device.current_status
+    method = if ([string]::IsNullOrWhiteSpace($Device.check_method)) { "ping" } else { "$($Device.check_method)" }
     checked_at = $now
   }
 }
@@ -838,6 +1052,88 @@ function Get-Summary($Store) {
   }
 }
 
+function Get-AvailabilityReport($Store) {
+  $now = Get-Date
+  $periodStart = $now.AddHours(-24)
+  $periodSeconds = [math]::Max(1, ($now - $periodStart).TotalSeconds)
+
+  return @(Get-CleanArray $Store.devices) | ForEach-Object {
+    $device = $_
+    $events = @(Get-CleanArray $Store.status_events | Where-Object { $_.device_id -eq $device.id })
+    $downSeconds = 0
+    foreach ($event in $events) {
+      $downAt = [datetime]::Parse($event.down_at)
+      $upAt = if ($null -eq $event.up_at) { $now } else { [datetime]::Parse($event.up_at) }
+      if ($upAt -gt $periodStart) {
+        $start = if ($downAt -lt $periodStart) { $periodStart } else { $downAt }
+        $end = if ($upAt -gt $now) { $now } else { $upAt }
+        $downSeconds += [math]::Max(0, ($end - $start).TotalSeconds)
+      }
+    }
+    $availability = [math]::Round([math]::Max(0, (1 - ($downSeconds / $periodSeconds)) * 100), 2)
+    [pscustomobject][ordered]@{
+      device_id = $device.id
+      name = $device.name
+      host = $device.host
+      type = $device.type
+      criticality = $device.criticality
+      current_status = $device.current_status
+      check_method = if ([string]::IsNullOrWhiteSpace($device.check_method)) { "ping" } else { $device.check_method }
+      down_seconds_24h = [int]$downSeconds
+      availability_24h = $availability
+      open_incident = $null -ne (Get-OpenEvent $Store $device.id)
+    }
+  } | Sort-Object availability_24h, name
+}
+
+function New-IntegrationFromBody($Body, [string]$Now) {
+  return [pscustomobject][ordered]@{
+    id = New-EntityId "int"
+    name = "$($Body.name)".Trim()
+    type = if ([string]::IsNullOrWhiteSpace($Body.type)) { "webhook" } else { "$($Body.type)".Trim().ToLowerInvariant() }
+    url = "$($Body.url)".Trim()
+    secret = if ([string]::IsNullOrWhiteSpace($Body.secret)) { "" } else { "$($Body.secret)".Trim() }
+    enabled = if ($null -eq $Body.enabled) { $true } else { [bool]$Body.enabled }
+    created_at = $Now
+    updated_at = $Now
+  }
+}
+
+function Get-PublicIntegration($Integration) {
+  return [pscustomobject][ordered]@{
+    id = $Integration.id
+    name = $Integration.name
+    type = $Integration.type
+    url = $Integration.url
+    secret_configured = -not [string]::IsNullOrWhiteSpace($Integration.secret)
+    enabled = $Integration.enabled
+    created_at = $Integration.created_at
+    updated_at = $Integration.updated_at
+  }
+}
+
+function Get-IntegrationBodyError($Body) {
+  if ($null -eq $Body -or [string]::IsNullOrWhiteSpace($Body.name) -or [string]::IsNullOrWhiteSpace($Body.url)) {
+    return "Nome e URL sao obrigatorios."
+  }
+  if ("$($Body.name)".Trim().Length -gt 80) {
+    return "Nome da integracao deve ter ate 80 caracteres."
+  }
+  if ("$($Body.url)".Trim().Length -gt 300) {
+    return "URL da integracao deve ter ate 300 caracteres."
+  }
+  if ("$($Body.url)" -notmatch "^https?://") {
+    return "Webhook deve iniciar com http:// ou https://."
+  }
+  if ($null -ne $Body.type -and "$($Body.type)".Trim().ToLowerInvariant() -ne "webhook") {
+    return "Tipo de integracao invalido."
+  }
+  if ($null -ne $Body.secret -and "$($Body.secret)".Length -gt 160) {
+    return "Segredo da integracao deve ter ate 160 caracteres."
+  }
+  return $null
+}
+
 function New-DeviceFromBody($Body, [string]$Now) {
   $isActive = if ($null -eq $Body.is_active) { $true } else { [bool]$Body.is_active }
   return [pscustomobject][ordered]@{
@@ -848,6 +1144,14 @@ function New-DeviceFromBody($Body, [string]$Now) {
     location = if ([string]::IsNullOrWhiteSpace($Body.location)) { "Nao informado" } else { "$($Body.location)".Trim() }
     criticality = if ([string]::IsNullOrWhiteSpace($Body.criticality)) { "media" } else { "$($Body.criticality)".Trim().ToLowerInvariant() }
     current_status = if ($Body.current_status) { "$($Body.current_status)".ToLowerInvariant() } else { "offline" }
+    check_method = if ([string]::IsNullOrWhiteSpace($Body.check_method)) { "ping" } else { "$($Body.check_method)".Trim().ToLowerInvariant() }
+    port = if ($null -eq $Body.port -or "$($Body.port)" -eq "") { $null } else { [int]$Body.port }
+    url_path = if ([string]::IsNullOrWhiteSpace($Body.url_path)) { "/" } else { "$($Body.url_path)".Trim() }
+    expected_status = if ($null -eq $Body.expected_status -or "$($Body.expected_status)" -eq "") { 200 } else { [int]$Body.expected_status }
+    owner = if ([string]::IsNullOrWhiteSpace($Body.owner)) { "" } else { "$($Body.owner)".Trim() }
+    tags = if ([string]::IsNullOrWhiteSpace($Body.tags)) { "" } else { "$($Body.tags)".Trim() }
+    notes = if ([string]::IsNullOrWhiteSpace($Body.notes)) { "" } else { "$($Body.notes)".Trim() }
+    maintenance_until = if ([string]::IsNullOrWhiteSpace($Body.maintenance_until)) { $null } else { "$($Body.maintenance_until)".Trim() }
     is_active = $isActive
     last_check_at = $null
     created_at = $Now
@@ -856,13 +1160,22 @@ function New-DeviceFromBody($Body, [string]$Now) {
 }
 
 function Update-DeviceFromBody($Device, $Body, [string]$Now) {
-  foreach ($field in @("name", "host", "type", "location", "criticality", "current_status")) {
+  foreach ($field in @("name", "host", "type", "location", "criticality", "current_status", "check_method", "url_path", "owner", "tags", "notes", "maintenance_until")) {
     if ($null -ne $Body.$field) {
       $value = "$($Body.$field)".Trim()
-      if ($field -in @("criticality", "current_status")) {
+      if ($field -in @("criticality", "current_status", "check_method")) {
         $value = $value.ToLowerInvariant()
       }
+      if ($field -eq "maintenance_until" -and [string]::IsNullOrWhiteSpace($value)) {
+        $value = $null
+      }
       $Device.$field = $value
+    }
+  }
+
+  foreach ($field in @("port", "expected_status")) {
+    if ($null -ne $Body.$field) {
+      $Device.$field = if ("$($Body.$field)" -eq "") { $null } else { [int]$Body.$field }
     }
   }
 
@@ -1104,6 +1417,87 @@ function Handle-ApiRequest($Context) {
         alerts = $store.alerts
       })
       return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/reports/availability") {
+      Send-JsonArray $Context (Get-AvailabilityReport $store)
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/integrations") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem listar integracoes." }) 403
+        return
+      }
+      $items = @(Get-CleanArray $store.integrations) | ForEach-Object { Get-PublicIntegration $_ }
+      Send-JsonArray $Context $items
+      return
+    }
+
+    if ($method -eq "POST" -and $path -eq "/api/integrations") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem criar integracoes." }) 403
+        return
+      }
+      $body = Read-RequestJson $request
+      $bodyError = Get-IntegrationBodyError $body
+      if ($null -ne $bodyError) {
+        Send-Json $Context ([pscustomobject]@{ error = $bodyError }) 400
+        return
+      }
+      $integration = New-IntegrationFromBody $body (Get-NowIso)
+      $store.integrations = @(Get-CleanArray $store.integrations) + $integration
+      Add-AuditLog $store $currentUser "integrations.create" "integration" $integration.id ([pscustomobject]@{ type = $integration.type })
+      Save-Store $store
+      Send-Json $Context (Get-PublicIntegration $integration) 201
+      return
+    }
+
+    if ($segments.Count -ge 3 -and $segments[0] -eq "api" -and $segments[1] -eq "integrations") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem gerenciar integracoes." }) 403
+        return
+      }
+
+      $integrationId = $segments[2]
+      $integration = @(Get-CleanArray $store.integrations) | Where-Object { $_.id -eq $integrationId } | Select-Object -First 1
+      if ($null -eq $integration) {
+        Send-Json $Context ([pscustomobject]@{ error = "Integracao nao encontrada." }) 404
+        return
+      }
+
+      if ($method -eq "PUT" -and $segments.Count -eq 3) {
+        $body = Read-RequestJson $request
+        $bodyError = Get-IntegrationBodyError $body
+        if ($null -ne $bodyError) {
+          Send-Json $Context ([pscustomobject]@{ error = $bodyError }) 400
+          return
+        }
+        foreach ($field in @("name", "type", "url")) {
+          if ($null -ne $body.$field) {
+            $value = "$($body.$field)".Trim()
+            if ($field -eq "type") { $value = $value.ToLowerInvariant() }
+            $integration.$field = $value
+          }
+        }
+        if ($null -ne $body.secret -and -not [string]::IsNullOrWhiteSpace($body.secret)) {
+          $integration.secret = "$($body.secret)".Trim()
+        }
+        if ($null -ne $body.enabled) { $integration.enabled = [bool]$body.enabled }
+        $integration.updated_at = Get-NowIso
+        Add-AuditLog $store $currentUser "integrations.update" "integration" $integration.id $null
+        Save-Store $store
+        Send-Json $Context (Get-PublicIntegration $integration)
+        return
+      }
+
+      if ($method -eq "DELETE" -and $segments.Count -eq 3) {
+        $store.integrations = @(Get-CleanArray $store.integrations | Where-Object { $_.id -ne $integrationId })
+        Add-AuditLog $store $currentUser "integrations.delete" "integration" $integrationId $null
+        Save-Store $store
+        Send-Json $Context ([pscustomobject]@{ ok = $true })
+        return
+      }
     }
 
     if ($method -eq "GET" -and $path -eq "/api/users") {

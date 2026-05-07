@@ -32,7 +32,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -443,7 +444,8 @@ button:disabled {
 }
 
 .input,
-.select {
+.select,
+.textarea {
   min-height: 38px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -452,9 +454,16 @@ button:disabled {
   outline: none;
 }
 
-.input {
+.input,
+.textarea {
   min-width: 210px;
   padding: 9px 12px;
+}
+
+.textarea {
+  width: 100%;
+  min-height: 92px;
+  resize: vertical;
 }
 
 .select {
@@ -462,9 +471,11 @@ button:disabled {
 }
 
 .input:focus,
-.select:focus {
+.select:focus,
+.textarea:focus {
   border-color: var(--blue);
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+  outline: none;
 }
 
 .button {
@@ -619,6 +630,11 @@ th {
 .badge.medium {
   background: var(--amber-soft);
   color: #b77909;
+}
+
+.badge.maintenance {
+  background: #fff7ed;
+  color: #c2410c;
 }
 
 .badge.inactive {
@@ -801,6 +817,8 @@ th {
 
 .modal {
   width: min(680px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow: auto;
   border-radius: var(--radius);
   background: white;
   box-shadow: 0 24px 70px rgba(15, 23, 42, 0.28);

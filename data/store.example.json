@@ -32,5 +32,11 @@
                      "require_csrf":  true,
                      "allow_viewer_export":  false,
                      "updated_at":  null
-                 }
+                 },
+    "integrations":  [
+
+                     ],
+    "integration_deliveries":  [
+
+                               ]
 }

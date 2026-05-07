@@ -1,4 +1,4 @@
-# Sword 3.0
+# Sword 4.0
 
 <p align="center">
   <img src="./public/sword-logo.svg" alt="Sword logo" width="96">
@@ -16,7 +16,7 @@
 
 ## Visao geral
 
-Primeira versao com identidade Sword e endurecimento de seguranca.
+Versao operacional com metodos de monitoramento, relatorios e integracoes.
 
 Sword foi criado e desenvolvido por Lucas Lima (LucasLimaSzDev) como uma
 solucao local para acompanhar disponibilidade, ativos, alertas e incidentes de
@@ -24,11 +24,11 @@ infraestrutura.
 
 ## Destaques da versao
 
-- Identidade visual Sword.
-- CSRF em acoes de escrita.
-- Rate limit de login.
-- Headers defensivos e politica CSP.
-- Auditoria administrativa, backup manual e exportacao controlada por cargo.
+- Metodos de verificacao Ping/ICMP, TCP, HTTP e HTTPS.
+- Cadastro de ativos com responsavel, tags, observacoes e manutencao.
+- Relatorio de disponibilidade de 24h por ativo.
+- Painel operacional com piores disponibilidades e incidentes abertos.
+- Integracoes por webhook JSON para alertas criticos.
 
 ## Como executar
 

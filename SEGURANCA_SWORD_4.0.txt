@@ -1,0 +1,150 @@
+SWORD 4.0 - SEGURANCA, INTEGRACAO E OPERACAO
+=============================================
+
+Objetivo
+--------
+Este documento descreve os avancos da versao 4.0 do Sword para uso em rede
+interna corporativa. O foco e proteger informacoes sensiveis de infraestrutura,
+evitar injecoes externas, restringir acesso por cargo e deixar o sistema pronto
+para integracoes profissionais.
+
+Dados protegidos
+----------------
+O Sword armazena nomes de ativos, IPs, hostnames, localizacoes, criticidade,
+historico de quedas, alertas, usuarios, sessoes, auditoria e configuracoes de
+integracao. Esses dados devem ser tratados como confidenciais, pois revelam a
+topologia e o comportamento operacional da empresa.
+
+Avancos de seguranca implementados
+----------------------------------
+1. Autenticacao obrigatoria
+   - A API operacional exige usuario autenticado.
+   - A primeira execucao exige setup do administrador inicial.
+
+2. Autorizacao por cargo
+   - Administrador: controle total.
+   - Operador: operacao de dispositivos, verificacoes e alertas.
+   - Visualizador: somente leitura.
+   - Rotas sensiveis retornam 403 quando o cargo nao permite a acao.
+
+3. Senhas protegidas
+   - Senhas nao sao salvas em texto puro.
+   - O backend usa PBKDF2-SHA256 com salt individual.
+   - Cada usuario possui hash proprio.
+
+4. Sessoes protegidas
+   - Cookie HttpOnly.
+   - SameSite=Strict.
+   - Expiracao configuravel.
+   - Logout revoga sessao no servidor.
+
+5. Protecao anti-CSRF
+   - Acoes POST, PUT e DELETE exigem X-CSRF-Token.
+   - O token e vinculado a sessao.
+   - Requisicoes de escrita sem token valido sao bloqueadas.
+
+6. Rate limit de login
+   - Tentativas falhas sao limitadas por email e origem.
+   - Reduz risco de brute force.
+   - Bloqueios e falhas sao registrados em auditoria.
+
+7. Headers defensivos
+   - Content-Security-Policy.
+   - X-Frame-Options DENY.
+   - X-Content-Type-Options nosniff.
+   - Referrer-Policy no-referrer.
+   - Permissions-Policy desabilitando camera, microfone e geolocalizacao.
+
+8. Validacao de entrada
+   - Host/IP com caracteres restritos.
+   - Validacao de criticidade, status, cargo e configuracoes numericas.
+   - Validacao de porta TCP, status HTTP esperado, caminho HTTP e manutencao.
+   - Limite de corpo HTTP em 1 MB.
+   - Ping, TCP e HTTP usam APIs nativas do .NET, sem montar comandos de shell
+     com dados enviados pelo usuario.
+
+9. Auditoria
+   - Login, falha de login, setup, usuarios, dispositivos, alertas, senha,
+     exportacao, backup e integracoes sao auditados.
+   - Administradores possuem tela dedicada para revisao.
+
+10. Backup e exportacao
+   - Backup manual local para administradores.
+   - Exportacao controlada por cargo.
+   - Operacoes sensiveis sao auditadas.
+
+11. Integracoes com segredo
+   - Webhooks recebem JSON controlado.
+   - Segredo opcional e enviado no header X-Sword-Secret.
+   - O segredo nao e devolvido em listagens publicas da API.
+
+Avancos operacionais da 4.0
+---------------------------
+1. Monitoramento por metodo
+   - Ping/ICMP para presenca na rede.
+   - TCP para portas especificas.
+   - HTTP/HTTPS para servicos web, APIs e endpoints de health check.
+
+2. Cadastro enriquecido
+   - Responsavel.
+   - Tags.
+   - Observacoes.
+   - Janela de manutencao.
+   - Porta, caminho HTTP e status esperado.
+
+3. Relatorios
+   - Disponibilidade de 24h por ativo.
+   - Soma de indisponibilidade por ativo.
+   - Incidentes abertos em destaque.
+
+4. Alertas profissionais
+   - Alertas automaticos para criticidade alta e critica.
+   - Webhook para futuras integracoes com NOC, GLPI, Jira, Teams, Slack,
+     email, WhatsApp ou SIEM.
+
+5. UI de apresentacao
+   - Dashboard sem placeholders.
+   - Estado vazio profissional.
+   - Icones de equipamento em SVG local.
+   - Identidade visual Sword.
+
+Ambiente recomendado
+--------------------
+Rede fechada:
+  Correto para aumentar a seguranca. O ideal e manter o Sword acessivel apenas
+  dentro da LAN/VPN corporativa, com firewall permitindo origens confiaveis.
+
+HTTPS:
+  Obrigatorio para uso com mais usuarios ou acesso por outros computadores.
+  Use Nginx, Caddy, IIS, Cloudflare Tunnel/Zero Trust ou outro reverse proxy.
+
+Sistema operacional:
+  Rode o Sword com usuario sem privilegio administrativo.
+  Restrinja permissoes NTFS da pasta do projeto, especialmente data/store.json
+  e backups.
+  Mantenha Windows atualizado e EDR/antivirus ativo.
+
+Banco:
+  O JSON local e bom para MVP e apresentacao.
+  Para producao real, planeje SQLite ou PostgreSQL com backup, permissoes,
+  criptografia de disco e rotina de restauracao testada.
+
+Backups:
+  A pasta backups contem dados sensiveis.
+  Proteja com permissoes, criptografia e copia offline/cofre corporativo.
+
+Segredos:
+  Tokens, client secrets e senhas de integracao nao devem entrar no codigo.
+  Use variaveis de ambiente, arquivo protegido ou cofre corporativo.
+
+MFA/SSO:
+  Ainda recomendado para fase futura.
+  Opcoes: TOTP, Google Login, Microsoft Login ou SSO corporativo.
+
+Resumo
+------
+A versao 4.0 eleva o Sword de um MVP visual para uma base operacional real:
+login, cargos, CSRF, rate limit, auditoria, headers defensivos, monitoramento
+por metodo, manutencao, relatorios e webhooks. Em rede fechada, com firewall,
+HTTPS e permissoes corretas, o risco cai bastante. A seguranca final depende
+do conjunto aplicacao + servidor + rede + processos de backup e auditoria.

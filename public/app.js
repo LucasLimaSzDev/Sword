@@ -19,6 +19,8 @@
     users: [],
     audit: [],
     backups: [],
+    report: [],
+    integrations: [],
     filters: {
       search: "",
       status: "all",
@@ -32,28 +34,46 @@
     },
     modal: null,
     userModal: null,
-    passwordModal: null
+    passwordModal: null,
+    integrationModal: null
   };
 
   const DEVICE_TYPES = [
     "Computador",
     "Notebook",
     "Servidor",
+    "Servidor Windows",
+    "Servidor Linux",
     "Banco de Dados",
     "Firewall",
     "Switch",
     "Roteador",
+    "Proxy",
+    "Link Internet",
     "Access Point",
+    "Controladora Wi-Fi",
     "Impressora",
     "Storage/NAS",
     "Virtualizador",
     "Camera IP",
+    "DVR/NVR",
     "Telefone IP",
     "Nobreak/UPS",
+    "Thin Client",
+    "Terminal POS",
+    "Relogio de Ponto",
+    "Catraca",
     "Sensor IoT",
     "Gateway",
     "Servico",
     "Outro"
+  ];
+
+  const CHECK_METHODS = [
+    ["ping", "Ping / ICMP"],
+    ["tcp", "Porta TCP"],
+    ["http", "HTTP"],
+    ["https", "HTTPS"]
   ];
 
   const app = document.getElementById("app");
@@ -167,6 +187,26 @@
       minute: "2-digit",
       second: "2-digit"
     });
+  }
+
+  function toDateTimeLocal(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+    return local.toISOString().slice(0, 16);
+  }
+
+  function methodLabel(value) {
+    const method = String(value || "ping").toLowerCase();
+    const found = CHECK_METHODS.find((item) => item[0] === method);
+    return found ? found[1] : method;
+  }
+
+  function isMaintenanceActive(device) {
+    if (!device || !device.maintenance_until) return false;
+    const date = new Date(device.maintenance_until);
+    return !Number.isNaN(date.getTime()) && date.getTime() > Date.now();
   }
 
   function timeAgo(value) {
@@ -371,14 +411,29 @@
     }
   }
 
+  async function loadReport() {
+    state.report = asArray(await api.get("/api/reports/availability"));
+  }
+
+  async function loadIntegrations() {
+    if (!isAdmin()) {
+      state.integrations = [];
+      return;
+    }
+    state.integrations = asArray(await api.get("/api/integrations"));
+  }
+
   function pageTitle() {
     const map = {
       dashboard: ["Dashboard", "Visao geral da infraestrutura"],
+      operation: ["Operacao", "Disponibilidade, metodos e prioridades"],
       devices: ["Dispositivos", "Cadastro e operacao dos ativos monitorados"],
       alerts: ["Alertas", "Ocorrencias criticas em aberto"],
       history: ["Historico", "Eventos de disponibilidade e indisponibilidade"],
+      reports: ["Relatorios", "Disponibilidade e SLA operacional"],
       users: ["Usuarios", "Controle de acesso e cargos"],
       audit: ["Auditoria", "Rastro de seguranca e operacao"],
+      integrations: ["Integracoes", "Webhooks e automacoes externas"],
       security: ["Seguranca", "Configuracoes, backup e protecoes do Sword"]
     };
     return map[state.view] || map.dashboard;
@@ -437,6 +492,7 @@
           ${state.modal ? renderModal() : ""}
           ${state.userModal ? renderUserModal() : ""}
           ${state.passwordModal ? renderPasswordModal() : ""}
+          ${state.integrationModal ? renderIntegrationModal() : ""}
           ${state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : ""}
         </div>
       `;
@@ -518,7 +574,7 @@
   function renderSetupScreen() {
     return renderAuthShell(
       "Criar administrador",
-      "Configure o primeiro usuario com permissao total para iniciar a versao 2.0.",
+      "Configure o primeiro usuario com permissao total para iniciar o Sword 4.0.",
       `
         <form class="auth-form" id="setup-form">
           <label>Nome<input class="input" name="name" required autocomplete="name"></label>
@@ -556,12 +612,15 @@
     const count = openAlerts().length;
     const items = [
       ["dashboard", "DB", "Dashboard"],
+      ["operation", "OP", "Operacao"],
       ["devices", "DV", "Dispositivos"],
       ["alerts", "AL", "Alertas"],
       ["history", "EV", "Historico"],
+      ["reports", "RP", "Relatorios"],
       ["security", "SC", "Seguranca"]
     ];
     if (isAdmin()) {
+      items.push(["integrations", "IN", "Integracoes"]);
       items.push(["users", "US", "Usuarios"]);
       items.push(["audit", "AU", "Auditoria"]);
     }
@@ -601,10 +660,13 @@
 
   function renderView() {
     if (state.view === "devices") return renderDevicesPage();
+    if (state.view === "operation") return renderOperationPage();
     if (state.view === "alerts") return renderAlertsPage();
     if (state.view === "history") return renderHistoryPage();
+    if (state.view === "reports") return renderReportsPage();
     if (state.view === "users") return renderUsersPage();
     if (state.view === "audit") return renderAuditPage();
+    if (state.view === "integrations") return renderIntegrationsPage();
     if (state.view === "security") return renderSecurityPage();
     return renderDashboard();
   }
@@ -699,6 +761,59 @@
     `;
   }
 
+  function renderOperationPage() {
+    const report = asArray(state.report).length ? state.report : asArray(state.devices).map((device) => ({
+      device_id: device.id,
+      name: device.name,
+      host: device.host,
+      type: device.type,
+      criticality: device.criticality,
+      current_status: device.current_status,
+      check_method: device.check_method || "ping",
+      availability_24h: device.current_status === "online" ? 100 : 0,
+      down_seconds_24h: 0,
+      open_incident: device.current_status === "offline"
+    }));
+    const worst = report.slice(0, 8);
+    return `
+      ${renderMetrics()}
+      <section class="table-panel">
+        <div class="section-header" style="padding: 18px 18px 0;">
+          <h2 class="section-title">Painel operacional</h2>
+          <button class="button" data-action="refresh-report">Atualizar relatorio</button>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Ativo</th>
+                <th>Metodo</th>
+                <th>Criticidade</th>
+                <th>Status</th>
+                <th>Disponibilidade 24h</th>
+                <th>Indisponibilidade 24h</th>
+                <th>Incidente</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${worst.map((row) => `
+                <tr>
+                  <td><div class="device-name">${deviceIcon(row.type)}<span>${escapeHtml(row.name)}</span></div><div class="mini-text">${escapeHtml(row.host)}</div></td>
+                  <td><span class="badge inactive">${escapeHtml(methodLabel(row.check_method))}</span></td>
+                  <td><span class="badge ${criticalityClass(row.criticality)}">${labelCriticality(row.criticality)}</span></td>
+                  <td><span class="badge ${row.current_status}">${String(row.current_status || "-").toUpperCase()}</span></td>
+                  <td><strong>${Number(row.availability_24h || 0).toFixed(2)}%</strong></td>
+                  <td>${formatDuration(row.down_seconds_24h || 0)}</td>
+                  <td>${row.open_incident ? `<span class="badge offline">ABERTO</span>` : `<span class="badge online">OK</span>`}</td>
+                </tr>
+              `).join("") || `<tr><td colspan="7"><div class="empty-state">Sem dados operacionais ainda.</div></td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `;
+  }
+
   function renderFilters() {
     const types = [...new Set(DEVICE_TYPES.concat(asArray(state.devices).map((device) => device.type).filter(Boolean)))].sort();
     return `
@@ -759,8 +874,12 @@
   }
 
   function renderDeviceRow(device) {
-    const status = device.is_active ? device.current_status : "inactive";
+    const maintenance = isMaintenanceActive(device);
+    const status = device.is_active ? (maintenance ? "maintenance" : device.current_status) : "inactive";
     const lastCheck = device.last_check_at ? timeAgo(device.last_check_at) : "Nunca verificado";
+    const endpoint = [methodLabel(device.check_method), device.port ? `porta ${device.port}` : "", device.url_path && device.url_path !== "/" ? device.url_path : ""]
+      .filter(Boolean)
+      .join(" - ");
     return `
       <tr>
         <td>
@@ -770,12 +889,12 @@
             ${escapeHtml(device.name)}
           </div>
         </td>
-        <td>${escapeHtml(device.host)}</td>
+        <td>${escapeHtml(device.host)}<div class="mini-text">${escapeHtml(endpoint)}</div></td>
         <td>${escapeHtml(device.type)}</td>
         <td>${escapeHtml(device.location)}</td>
         <td><span class="badge ${criticalityClass(device.criticality)}">${labelCriticality(device.criticality)}</span></td>
         <td>${lastCheck}</td>
-        <td><span class="badge ${status}">${status === "inactive" ? "INATIVO" : device.current_status.toUpperCase()}</span></td>
+        <td><span class="badge ${status}">${status === "inactive" ? "INATIVO" : status === "maintenance" ? "MANUTENCAO" : device.current_status.toUpperCase()}</span></td>
         <td>
           ${canOperate() ? `
             <div class="row-actions">
@@ -970,6 +1089,73 @@
     `;
   }
 
+  function renderReportsPage() {
+    const report = asArray(state.report);
+    const avg = report.length ? report.reduce((sum, item) => sum + Number(item.availability_24h || 0), 0) / report.length : 0;
+    const down = report.reduce((sum, item) => sum + Number(item.down_seconds_24h || 0), 0);
+    return `
+      <div class="metric-grid">
+        <article class="metric-card"><div class="metric-icon green">SLA</div><div><div class="metric-label">Media 24h</div><div class="metric-value">${avg.toFixed(2)}%</div><div class="metric-help">Disponibilidade media</div></div></article>
+        <article class="metric-card"><div class="metric-icon red">DOWN</div><div><div class="metric-label">Indisponibilidade</div><div class="metric-value">${formatDuration(down)}</div><div class="metric-help">Soma em 24h</div></div></article>
+        <article class="metric-card"><div class="metric-icon amber">INC</div><div><div class="metric-label">Incidentes abertos</div><div class="metric-value">${report.filter((item) => item.open_incident).length}</div><div class="metric-help">Ativos com queda aberta</div></div></article>
+        <article class="metric-card"><div class="metric-icon">REP</div><div><div class="metric-label">Ativos avaliados</div><div class="metric-value">${report.length}</div><div class="metric-help">Base do relatorio</div></div></article>
+      </div>
+      <section class="table-panel">
+        <div class="section-header" style="padding: 18px 18px 0;">
+          <h2 class="section-title">Relatorio de disponibilidade por ativo</h2>
+          <button class="button" data-action="refresh-report">Atualizar</button>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Ativo</th><th>Host</th><th>Metodo</th><th>Disponibilidade 24h</th><th>Down 24h</th><th>Incidente</th></tr></thead>
+            <tbody>
+              ${report.map((row) => `
+                <tr>
+                  <td><div class="device-name">${deviceIcon(row.type)}<span>${escapeHtml(row.name)}</span></div></td>
+                  <td>${escapeHtml(row.host)}</td>
+                  <td><span class="badge inactive">${escapeHtml(methodLabel(row.check_method))}</span></td>
+                  <td><strong>${Number(row.availability_24h || 0).toFixed(2)}%</strong></td>
+                  <td>${formatDuration(row.down_seconds_24h || 0)}</td>
+                  <td>${row.open_incident ? `<span class="badge offline">ABERTO</span>` : `<span class="badge online">OK</span>`}</td>
+                </tr>
+              `).join("") || `<tr><td colspan="6"><div class="empty-state">Sem dados de relatorio.</div></td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderIntegrationsPage() {
+    if (!isAdmin()) return `<section class="panel">Apenas administradores podem acessar integracoes.</section>`;
+    return `
+      <section class="table-panel">
+        <div class="section-header" style="padding: 18px 18px 0;">
+          <h2 class="section-title">Integracoes por webhook</h2>
+          <button class="button primary" data-action="new-integration">Nova integracao</button>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Nome</th><th>Tipo</th><th>URL</th><th>Segredo</th><th>Status</th><th>Atualizado</th><th></th></tr></thead>
+            <tbody>
+              ${asArray(state.integrations).map((integration) => `
+                <tr>
+                  <td><strong>${escapeHtml(integration.name)}</strong></td>
+                  <td><span class="badge inactive">${escapeHtml(integration.type)}</span></td>
+                  <td>${escapeHtml(integration.url)}</td>
+                  <td><span class="badge ${integration.secret_configured ? "online" : "inactive"}">${integration.secret_configured ? "CONFIGURADO" : "VAZIO"}</span></td>
+                  <td><span class="badge ${integration.enabled ? "online" : "inactive"}">${integration.enabled ? "ATIVA" : "INATIVA"}</span></td>
+                  <td>${integration.updated_at ? timeAgo(integration.updated_at) : "-"}</td>
+                  <td><div class="row-actions"><button class="button compact" data-action="edit-integration" data-id="${integration.id}">Editar</button><button class="button compact danger" data-action="delete-integration" data-id="${integration.id}">Excluir</button></div></td>
+                </tr>
+              `).join("") || `<tr><td colspan="7"><div class="empty-state">Nenhuma integracao cadastrada.</div></td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `;
+  }
+
   function renderUsersPage() {
     if (!isAdmin()) {
       return `<section class="panel">Apenas administradores podem acessar usuarios.</section>`;
@@ -1131,6 +1317,14 @@
       type: "Computador",
       location: "",
       criticality: "media",
+      check_method: "ping",
+      port: "",
+      url_path: "/",
+      expected_status: 200,
+      owner: "",
+      tags: "",
+      notes: "",
+      maintenance_until: "",
       is_active: true
     };
     const isEdit = Boolean(device.id);
@@ -1171,12 +1365,49 @@
                 <option value="critica"${device.criticality === "critica" ? " selected" : ""}>Critica</option>
               </select>
             </div>
+            <div class="field">
+              <label for="check_method">Metodo de verificacao</label>
+              <select class="select" id="check_method" name="check_method">
+                ${CHECK_METHODS.map(([value, label]) => `<option value="${value}"${(device.check_method || "ping") === value ? " selected" : ""}>${label}</option>`).join("")}
+              </select>
+              <div class="field-help">Ping para rede local; TCP/HTTP/HTTPS para servicos especificos.</div>
+            </div>
+            <div class="field">
+              <label for="port">Porta</label>
+              <input class="input" id="port" name="port" type="number" min="1" max="65535" value="${escapeHtml(device.port ?? "")}" placeholder="Ex: 80, 443, 3389">
+              <div class="field-help">Obrigatoria para TCP. Opcional para HTTP/HTTPS.</div>
+            </div>
+            <div class="field">
+              <label for="url_path">Caminho HTTP</label>
+              <input class="input" id="url_path" name="url_path" value="${escapeHtml(device.url_path || "/")}" placeholder="/">
+            </div>
+            <div class="field">
+              <label for="expected_status">Status esperado</label>
+              <input class="input" id="expected_status" name="expected_status" type="number" min="100" max="599" value="${escapeHtml(device.expected_status ?? 200)}" placeholder="200">
+            </div>
+            <div class="field">
+              <label for="owner">Responsavel</label>
+              <input class="input" id="owner" name="owner" value="${escapeHtml(device.owner || "")}" placeholder="Equipe, pessoa ou fornecedor">
+            </div>
+            <div class="field">
+              <label for="tags">Tags</label>
+              <input class="input" id="tags" name="tags" value="${escapeHtml(device.tags || "")}" placeholder="erp, matriz, windows">
+            </div>
+            <div class="field">
+              <label for="maintenance_until">Manutencao ate</label>
+              <input class="input" id="maintenance_until" name="maintenance_until" type="datetime-local" value="${toDateTimeLocal(device.maintenance_until)}">
+              <div class="field-help">Enquanto estiver em manutencao, o Sword pausa a checagem automatica.</div>
+            </div>
             <div class="field full">
               <label class="checkbox-field">
                 <input type="checkbox" name="is_active" ${device.is_active ? "checked" : ""}>
                 Ativo para monitoramento automatico
               </label>
               <div class="field-help">Dispositivos ativos entram nos ciclos de verificacao. Inativos permanecem cadastrados, mas nao sao testados.</div>
+            </div>
+            <div class="field full">
+              <label for="notes">Observacoes</label>
+              <textarea class="textarea" id="notes" name="notes" rows="3" maxlength="500" placeholder="Informacoes operacionais, janela de manutencao, dependencia ou procedimento interno">${escapeHtml(device.notes || "")}</textarea>
             </div>
           </div>
           <div class="modal-footer">
@@ -1271,6 +1502,60 @@
     `;
   }
 
+  function renderIntegrationModal() {
+    const integration = state.integrationModal.integration || {
+      name: "",
+      type: "webhook",
+      url: "",
+      secret_configured: false,
+      enabled: true
+    };
+    const isEdit = Boolean(integration.id);
+
+    return `
+      <div class="modal-backdrop">
+        <form class="modal" id="integration-form">
+          <div class="modal-header">
+            <h2 class="section-title">${isEdit ? "Editar integracao" : "Nova integracao"}</h2>
+            <button class="button icon-only" type="button" data-action="close-integration-modal">X</button>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label for="integration-name">Nome</label>
+              <input class="input" id="integration-name" name="name" required value="${escapeHtml(integration.name)}" placeholder="Webhook NOC">
+            </div>
+            <div class="field">
+              <label for="integration-type">Tipo</label>
+              <select class="select" id="integration-type" name="type">
+                <option value="webhook"${integration.type === "webhook" ? " selected" : ""}>Webhook JSON</option>
+              </select>
+            </div>
+            <div class="field full">
+              <label for="integration-url">URL do webhook</label>
+              <input class="input" id="integration-url" name="url" required value="${escapeHtml(integration.url)}" placeholder="https://exemplo.local/webhook/sword">
+              <div class="field-help">O Sword envia alertas criticos em JSON quando um ativo alto ou critico cai.</div>
+            </div>
+            <div class="field full">
+              <label for="integration-secret">Segredo opcional</label>
+              <input class="input" id="integration-secret" name="secret" type="password" autocomplete="new-password" placeholder="${isEdit && integration.secret_configured ? "Ja configurado; deixe em branco para manter" : "X-Sword-Secret"}">
+              <div class="field-help">${isEdit && integration.secret_configured ? "Existe um segredo configurado. Preencha apenas para substituir." : "Quando preenchido, ele sera enviado no header X-Sword-Secret."}</div>
+            </div>
+            <div class="field full">
+              <label class="checkbox-field">
+                <input type="checkbox" name="enabled" ${integration.enabled !== false ? "checked" : ""}>
+                Integracao ativa
+              </label>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="button" type="button" data-action="close-integration-modal">Cancelar</button>
+            <button class="button primary" type="submit">${isEdit ? "Salvar integracao" : "Criar integracao"}</button>
+          </div>
+        </form>
+      </div>
+    `;
+  }
+
   function bindEvents() {
     app.querySelectorAll("[data-view]").forEach((button) => {
       button.addEventListener("click", async () => {
@@ -1285,6 +1570,20 @@
         if (state.view === "audit") {
           try {
             await loadAudit();
+          } catch (error) {
+            setToast(error.message);
+          }
+        }
+        if (state.view === "reports" || state.view === "operation") {
+          try {
+            await loadReport();
+          } catch (error) {
+            setToast(error.message);
+          }
+        }
+        if (state.view === "integrations") {
+          try {
+            await loadIntegrations();
           } catch (error) {
             setToast(error.message);
           }
@@ -1341,6 +1640,11 @@
     if (passwordForm) {
       passwordForm.addEventListener("submit", handlePasswordSubmit);
     }
+
+    const integrationForm = app.querySelector("#integration-form");
+    if (integrationForm) {
+      integrationForm.addEventListener("submit", handleIntegrationSubmit);
+    }
   }
 
   async function handleAction(event) {
@@ -1383,6 +1687,12 @@
         render();
       }
 
+      if (action === "refresh-report") {
+        await loadReport();
+        setToast("Relatorio atualizado.");
+        render();
+      }
+
       if (action === "create-backup") {
         await api.post("/api/backups");
         await loadSecurityData();
@@ -1400,6 +1710,34 @@
         link.click();
         URL.revokeObjectURL(url);
         setToast("Exportacao preparada.");
+      }
+
+      if (action === "new-integration") {
+        state.integrationModal = { integration: null };
+        render();
+      }
+
+      if (action === "edit-integration") {
+        const integration = asArray(state.integrations).find((item) => item.id === id);
+        if (integration) {
+          state.integrationModal = { integration: { ...integration } };
+          render();
+        }
+      }
+
+      if (action === "close-integration-modal") {
+        state.integrationModal = null;
+        render();
+      }
+
+      if (action === "delete-integration") {
+        const integration = asArray(state.integrations).find((item) => item.id === id);
+        if (integration && window.confirm(`Excluir a integracao ${integration.name}?`)) {
+          await api.delete(`/api/integrations/${id}`);
+          await loadIntegrations();
+          setToast("Integracao removida.");
+          render();
+        }
       }
 
       if (action === "new-user") {
@@ -1533,6 +1871,14 @@
       type: form.get("type"),
       location: form.get("location"),
       criticality: form.get("criticality"),
+      check_method: form.get("check_method"),
+      port: form.get("port"),
+      url_path: form.get("url_path"),
+      expected_status: form.get("expected_status"),
+      owner: form.get("owner"),
+      tags: form.get("tags"),
+      notes: form.get("notes"),
+      maintenance_until: form.get("maintenance_until"),
       is_active: form.get("is_active") === "on"
     };
 
@@ -1587,6 +1933,33 @@
     }
   }
 
+  async function handleIntegrationSubmit(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = {
+      name: form.get("name"),
+      type: form.get("type"),
+      url: form.get("url"),
+      secret: form.get("secret"),
+      enabled: form.get("enabled") === "on"
+    };
+
+    try {
+      if (state.integrationModal.integration && state.integrationModal.integration.id) {
+        await api.put(`/api/integrations/${state.integrationModal.integration.id}`, payload);
+        setToast("Integracao atualizada.");
+      } else {
+        await api.post("/api/integrations", payload);
+        setToast("Integracao criada.");
+      }
+      state.integrationModal = null;
+      await loadIntegrations();
+      render();
+    } catch (error) {
+      setToast(error.message);
+    }
+  }
+
   async function handleSettingsSubmit(event) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -1635,7 +2008,7 @@
 
   loadAuthStatus();
   window.setInterval(() => {
-    if (state.auth.user && !state.modal && !state.userModal) {
+    if (state.auth.user && !state.modal && !state.userModal && !state.passwordModal && !state.integrationModal) {
       loadData({ silent: true });
     }
   }, 5000);

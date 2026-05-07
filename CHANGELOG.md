@@ -2,6 +2,16 @@
 
 Todas as versoes publicas do Sword listadas aqui foram criadas por Lucas Lima (LucasLimaSzDev).
 
+## v4.0 - 4.0
+
+Versao operacional com metodos de monitoramento, relatorios e integracoes.
+
+- Metodos de verificacao Ping/ICMP, TCP, HTTP e HTTPS.
+- Cadastro de ativos com responsavel, tags, observacoes e manutencao.
+- Relatorio de disponibilidade de 24h por ativo.
+- Painel operacional com piores disponibilidades e incidentes abertos.
+- Integracoes por webhook JSON para alertas criticos.
+
 ## v3.0 - 3.0
 
 Primeira versao com identidade Sword e endurecimento de seguranca.
