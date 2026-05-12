@@ -1,4 +1,4 @@
-# Sword 4.0
+# Sword 5.0
 
 <p align="center">
   <img src="./public/sword-logo.svg" alt="Sword logo" width="96">
@@ -16,7 +16,7 @@
 
 ## Visao geral
 
-Versao operacional com metodos de monitoramento, relatorios e integracoes.
+Versao focada em relatorios, exportacoes, temas e refinamento operacional.
 
 Sword foi criado e desenvolvido por Lucas Lima (LucasLimaSzDev) como uma
 solucao local para acompanhar disponibilidade, ativos, alertas e incidentes de
@@ -24,11 +24,11 @@ infraestrutura.
 
 ## Destaques da versao
 
-- Metodos de verificacao Ping/ICMP, TCP, HTTP e HTTPS.
-- Cadastro de ativos com responsavel, tags, observacoes e manutencao.
-- Relatorio de disponibilidade de 24h por ativo.
-- Painel operacional com piores disponibilidades e incidentes abertos.
-- Integracoes por webhook JSON para alertas criticos.
+- Relatorios por periodo e dispositivo.
+- Exportacoes CSV compativeis com Excel.
+- Historico e auditoria filtraveis e exportaveis.
+- Temas visuais, foto de usuario e bipe critico.
+- Campos adicionais para patrimonio, serial e modelo.
 
 ## Como executar
 

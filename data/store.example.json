@@ -31,12 +31,18 @@
                      "check_timeout_ms":  900,
                      "require_csrf":  true,
                      "allow_viewer_export":  false,
-                     "updated_at":  null
+                     "updated_at":  null,
+                     "critical_sound_enabled":  true,
+                     "critical_sound_minutes":  5,
+                     "ui_theme":  "system"
                  },
     "integrations":  [
 
                      ],
     "integration_deliveries":  [
 
-                               ]
+                               ],
+    "report_snapshots":  [
+
+                         ]
 }

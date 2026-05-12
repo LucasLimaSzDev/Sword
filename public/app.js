@@ -19,18 +19,37 @@
     users: [],
     audit: [],
     backups: [],
-    report: [],
+    report: null,
+    historyReport: null,
+    auditReport: null,
+    reportSnapshots: [],
     integrations: [],
+    theme: window.localStorage.getItem("sword-theme") || "system",
+    lastBeepAt: 0,
+    soundArmed: false,
     filters: {
       search: "",
       status: "all",
       type: "all",
       criticality: "all"
     },
+    reportFilters: {
+      device: "all",
+      from: "",
+      to: ""
+    },
+    auditFilters: {
+      user: "all",
+      action: "",
+      from: "",
+      to: ""
+    },
     historyFilters: {
       device: "all",
       status: "all",
-      criticality: "all"
+      criticality: "all",
+      from: "",
+      to: ""
     },
     modal: null,
     userModal: null,
@@ -77,6 +96,10 @@
   ];
 
   const app = document.getElementById("app");
+  document.documentElement.dataset.theme = state.theme;
+  document.addEventListener("pointerdown", () => {
+    state.soundArmed = true;
+  }, { once: true });
   const api = {
     get: (url) => request(url),
     post: (url, body) => request(url, { method: "POST", body }),
@@ -156,6 +179,9 @@
       check_timeout_ms: Number(value?.check_timeout_ms || 900),
       require_csrf: value?.require_csrf !== false,
       allow_viewer_export: Boolean(value?.allow_viewer_export),
+      critical_sound_enabled: value?.critical_sound_enabled !== false,
+      critical_sound_minutes: Number(value?.critical_sound_minutes || 5),
+      ui_theme: value?.ui_theme || "system",
       updated_at: value?.updated_at || new Date().toISOString()
     };
   }
@@ -237,6 +263,101 @@
     return parts.join(" ");
   }
 
+  function reportRows() {
+    return asArray(state.report?.rows);
+  }
+
+  function historyRows() {
+    return asArray(state.historyReport?.rows);
+  }
+
+  function auditRows() {
+    return asArray(state.auditReport?.rows);
+  }
+
+  function buildQuery(filters, kind) {
+    const params = new URLSearchParams();
+    if (filters.from) params.set("from", filters.from);
+    if (filters.to) params.set("to", filters.to);
+    if (filters.device && filters.device !== "all") params.set("device_id", filters.device);
+    if (kind === "audit") {
+      if (filters.user && filters.user !== "all") params.set("user_id", filters.user);
+      if (filters.action) params.set("action", filters.action);
+    }
+    const query = params.toString();
+    return query ? `?${query}` : "";
+  }
+
+  function downloadUrl(url) {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      if (!file) return resolve("");
+      if (file.size > 250000) return reject(new Error("Foto do usuario deve ter ate 250 KB."));
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error("Nao foi possivel ler a foto."));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function applyTheme(theme) {
+    state.theme = theme || "system";
+    window.localStorage.setItem("sword-theme", state.theme);
+    document.documentElement.dataset.theme = state.theme;
+  }
+
+  function renderAvatar(user) {
+    if (user?.avatar_data_url) {
+      return `<div class="avatar image"><img src="${escapeHtml(user.avatar_data_url)}" alt=""></div>`;
+    }
+    return `<div class="avatar">${escapeHtml(getInitials(user?.name))}</div>`;
+  }
+
+  function playCriticalBeep() {
+    if (!state.soundArmed) return;
+    const now = Date.now();
+    if (now - state.lastBeepAt < 60000) return;
+    state.lastBeepAt = now;
+    try {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) return;
+      const ctx = new AudioContext();
+      const gain = ctx.createGain();
+      gain.gain.value = 0.05;
+      gain.connect(ctx.destination);
+      [0, 180, 360].forEach((delay) => {
+        const osc = ctx.createOscillator();
+        osc.frequency.value = 880;
+        osc.type = "sine";
+        osc.connect(gain);
+        const start = ctx.currentTime + delay / 1000;
+        osc.start(start);
+        osc.stop(start + 0.12);
+      });
+      window.setTimeout(() => ctx.close(), 900);
+    } catch (error) {}
+  }
+
+  function evaluateCriticalSound() {
+    const settings = asSettings(state.settings);
+    if (!settings.critical_sound_enabled) return;
+    const thresholdMs = Math.max(1, settings.critical_sound_minutes) * 60000;
+    const needsSound = openAlerts().some((alert) => {
+      const critical = ["critical", "high"].includes(alert.priority) || ["critica", "alta"].includes(alert.device?.criticality);
+      const age = Date.now() - new Date(alert.created_at || Date.now()).getTime();
+      return critical && age >= thresholdMs;
+    });
+    if (needsSound) playCriticalBeep();
+  }
+
   function labelCriticality(value) {
     const map = {
       baixa: "Baixa",
@@ -263,7 +384,7 @@
   function filteredDevices() {
     const search = state.filters.search.trim().toLowerCase();
     return asArray(state.devices).filter((device) => {
-      const matchesSearch = !search || [device.name, device.host, device.type, device.location]
+      const matchesSearch = !search || [device.name, device.host, device.type, device.location, device.serial_number, device.asset_tag, device.model, device.owner, device.tags]
         .join(" ")
         .toLowerCase()
         .includes(search);
@@ -345,6 +466,7 @@
         state.settings = asSettings(await api.get("/api/settings"));
       }
       state.error = "";
+      evaluateCriticalSound();
     } catch (error) {
       state.error = error.message;
     } finally {
@@ -372,6 +494,9 @@
       state.auth.roles = asArray(status?.roles);
       state.auth.csrfToken = status?.csrf_token || "";
       state.settings = asSettings(status?.settings);
+      if (!window.localStorage.getItem("sword-theme")) {
+        applyTheme(state.settings.ui_theme || "system");
+      }
       if (state.auth.user) {
         await loadData({ silent: true });
       } else {
@@ -402,6 +527,10 @@
     }
 
     state.audit = asArray(await api.get("/api/audit"));
+    if (!state.users.length) {
+      state.users = asArray(await api.get("/api/users"));
+    }
+    state.auditReport = await api.get(`/api/audit/report${buildQuery(state.auditFilters, "audit")}`);
   }
 
   async function loadSecurityData() {
@@ -412,7 +541,12 @@
   }
 
   async function loadReport() {
-    state.report = asArray(await api.get("/api/reports/availability"));
+    state.report = await api.get(`/api/reports/availability${buildQuery(state.reportFilters, "report")}`);
+    state.reportSnapshots = asArray(await api.get("/api/report-snapshots"));
+  }
+
+  async function loadHistoryReport() {
+    state.historyReport = await api.get(`/api/history/report${buildQuery(state.historyFilters, "history")}`);
   }
 
   async function loadIntegrations() {
@@ -472,9 +606,18 @@
                 <div class="live-pill"><span class="live-dot"></span>Monitoramento ativo</div>
                 <div class="timestamp">Atualizado: ${state.summary ? timeAgo(state.summary.generated_at) : "-"}</div>
                 ${canOperate() ? `<button class="button" data-action="run-monitor">Verificar agora</button>` : ""}
+                <select class="select compact-select" data-theme-select aria-label="Tema">
+                  <option value="system"${state.theme === "system" ? " selected" : ""}>Sistema</option>
+                  <option value="light"${state.theme === "light" ? " selected" : ""}>Claro</option>
+                  <option value="dark"${state.theme === "dark" ? " selected" : ""}>Escuro</option>
+                  <option value="blackout"${state.theme === "blackout" ? " selected" : ""}>Blackout</option>
+                  <option value="steel"${state.theme === "steel" ? " selected" : ""}>Steel</option>
+                  <option value="contrast"${state.theme === "contrast" ? " selected" : ""}>Contraste</option>
+                </select>
+                <button class="button" data-action="test-sound">Bipe</button>
                 <button class="button" data-action="open-password-modal">Senha</button>
                 <div class="user-chip">
-                  <div class="avatar">${escapeHtml(getInitials(state.auth.user.name))}</div>
+                  ${renderAvatar(state.auth.user)}
                   <div>
                     <strong>${escapeHtml(state.auth.user.name)}</strong>
                     <div class="mini-text">${roleLabel(state.auth.user.role)}</div>
@@ -526,10 +669,12 @@
 
   function swordLogo() {
     return `
-      <svg viewBox="0 0 64 64" aria-hidden="true" focusable="false">
-        <path d="M32 4l7 8-5 9v19l12-12 8 8-15 11 3 6-10 7-10-7 3-6-15-11 8-8 12 12V21l-5-9 7-8z" fill="currentColor" opacity=".16"></path>
-        <path d="M32 5l5 8-4 8v27l5 8-6 4-6-4 5-8V21l-4-8 5-8z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"></path>
-        <path d="M15 32l12 8h10l12-8" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"></path>
+      <svg viewBox="0 0 64 64" aria-hidden="true" focusable="false" class="sword-logo-svg">
+        <path class="logo-halo" d="M32 4l7 7-3 8v22l12-9 7 8-17 8 2 6-8 6-8-6 2-6-17-8 7-8 12 9V19l-3-8 7-7z"></path>
+        <path class="logo-blade" d="M32 4l6 10-4 8v27l-2 9-2-9V22l-4-8 6-10z"></path>
+        <path class="logo-blade-line" d="M32 14v40"></path>
+        <path class="logo-guard" d="M13 36c8-1 13 1 17 6h4c4-5 9-7 17-6"></path>
+        <path class="logo-grip" d="M27 44h10M28 50h8M30 56h4"></path>
       </svg>
     `;
   }
@@ -574,7 +719,7 @@
   function renderSetupScreen() {
     return renderAuthShell(
       "Criar administrador",
-      "Configure o primeiro usuario com permissao total para iniciar o Sword 4.0.",
+      "Configure o primeiro usuario com permissao total para iniciar o Sword 5.0.",
       `
         <form class="auth-form" id="setup-form">
           <label>Nome<input class="input" name="name" required autocomplete="name"></label>
@@ -762,7 +907,8 @@
   }
 
   function renderOperationPage() {
-    const report = asArray(state.report).length ? state.report : asArray(state.devices).map((device) => ({
+    const currentRows = reportRows();
+    const report = currentRows.length ? currentRows : asArray(state.devices).map((device) => ({
       device_id: device.id,
       name: device.name,
       host: device.host,
@@ -770,8 +916,8 @@
       criticality: device.criticality,
       current_status: device.current_status,
       check_method: device.check_method || "ping",
-      availability_24h: device.current_status === "online" ? 100 : 0,
-      down_seconds_24h: 0,
+      availability_percent: device.current_status === "online" ? 100 : 0,
+      down_seconds: 0,
       open_incident: device.current_status === "offline"
     }));
     const worst = report.slice(0, 8);
@@ -802,8 +948,8 @@
                   <td><span class="badge inactive">${escapeHtml(methodLabel(row.check_method))}</span></td>
                   <td><span class="badge ${criticalityClass(row.criticality)}">${labelCriticality(row.criticality)}</span></td>
                   <td><span class="badge ${row.current_status}">${String(row.current_status || "-").toUpperCase()}</span></td>
-                  <td><strong>${Number(row.availability_24h || 0).toFixed(2)}%</strong></td>
-                  <td>${formatDuration(row.down_seconds_24h || 0)}</td>
+                  <td><strong>${Number(row.availability_percent || row.availability_24h || 0).toFixed(2)}%</strong></td>
+                  <td>${formatDuration(row.down_seconds || row.down_seconds_24h || 0)}</td>
                   <td>${row.open_incident ? `<span class="badge offline">ABERTO</span>` : `<span class="badge online">OK</span>`}</td>
                 </tr>
               `).join("") || `<tr><td colspan="7"><div class="empty-state">Sem dados operacionais ainda.</div></td></tr>`}
@@ -888,6 +1034,7 @@
             ${deviceIcon(device.type)}
             ${escapeHtml(device.name)}
           </div>
+          <div class="mini-text">${escapeHtml([device.serial_number, device.asset_tag, device.model].filter(Boolean).join(" - "))}</div>
         </td>
         <td>${escapeHtml(device.host)}<div class="mini-text">${escapeHtml(endpoint)}</div></td>
         <td>${escapeHtml(device.type)}</td>
@@ -1030,7 +1177,22 @@
   }
 
   function renderHistoryPage() {
-    const events = filteredEvents();
+    let rows = historyRows().length ? historyRows() : filteredEvents().map((event) => ({
+      device_name: event.device?.name || event.device_id,
+      host: event.device?.host || "",
+      event_type: event.status === "open" ? "down_aberto" : "down_up_resolvido",
+      down_at: event.down_at,
+      up_at: event.up_at,
+      duration_seconds: event.status === "open" ? null : event.duration_seconds,
+      criticality: event.criticality,
+      status: event.status
+    }));
+    rows = rows.filter((row) => {
+      const statusMatch = state.historyFilters.status === "all" || row.status === state.historyFilters.status;
+      const criticalityMatch = state.historyFilters.criticality === "all" || row.criticality === state.historyFilters.criticality;
+      return statusMatch && criticalityMatch;
+    });
+    const summary = state.historyReport?.summary || {};
     return `
       <section class="table-panel">
         <div class="section-header" style="padding: 18px 18px 0;">
@@ -1051,22 +1213,34 @@
               <option value="alta"${state.historyFilters.criticality === "alta" ? " selected" : ""}>Alta</option>
               <option value="critica"${state.historyFilters.criticality === "critica" ? " selected" : ""}>Critica</option>
             </select>
+            <input class="input compact-date" type="datetime-local" data-history-filter="from" value="${escapeHtml(state.historyFilters.from)}">
+            <input class="input compact-date" type="datetime-local" data-history-filter="to" value="${escapeHtml(state.historyFilters.to)}">
+            <button class="button" data-action="apply-history-report">Filtrar</button>
+            <button class="button" data-action="download-history">Baixar Excel</button>
+            ${isAdmin() ? `<button class="button danger" data-action="clear-history">Limpar historico</button>` : ""}
           </div>
+        </div>
+        <div class="report-strip">
+          <span><strong>${Number(summary.events || rows.length)}</strong> evento(s)</span>
+          <span><strong>${Number(summary.open_events || 0)}</strong> aberto(s)</span>
+          <span><strong>${formatDuration(summary.total_duration_seconds || 0)}</strong> indisponibilidade total</span>
         </div>
         <div class="table-scroll">
           <table>
             <thead>
               <tr>
                 <th>Dispositivo</th>
-                <th>Tipo do evento</th>
-                <th>Data e hora</th>
+                <th>Host</th>
+                <th>Evento</th>
+                <th>Down</th>
+                <th>Up</th>
                 <th>Duracao</th>
                 <th>Criticidade</th>
                 <th>Status</th>
               </tr>
             </thead>
             <tbody>
-              ${events.map(renderHistoryRow).join("") || `<tr><td colspan="6"><div class="empty-state">Sem eventos para os filtros atuais.</div></td></tr>`}
+              ${rows.map(renderHistoryRow).join("") || `<tr><td colspan="8"><div class="empty-state">Sem eventos para os filtros atuais.</div></td></tr>`}
             </tbody>
           </table>
         </div>
@@ -1075,13 +1249,14 @@
   }
 
   function renderHistoryRow(event) {
-    const type = event.status === "open" ? "down" : "up";
-    const date = event.status === "open" ? event.down_at : event.up_at;
+    const type = event.event_type || (event.status === "open" ? "down" : "up");
     return `
       <tr>
-        <td>${escapeHtml(event.device?.name || event.device_id)}</td>
-        <td>${type}</td>
-        <td>${formatDate(date)}</td>
+        <td>${escapeHtml(event.device_name || event.device?.name || event.device_id)}</td>
+        <td>${escapeHtml(event.host || event.device?.host || "-")}</td>
+        <td>${escapeHtml(type)}</td>
+        <td>${formatDate(event.down_at)}</td>
+        <td>${formatDate(event.up_at)}</td>
         <td>${event.status === "open" ? timeAgo(event.down_at) : formatDuration(event.duration_seconds)}</td>
         <td><span class="badge ${criticalityClass(event.criticality)}">${labelCriticality(event.criticality)}</span></td>
         <td><span class="badge ${event.status === "open" ? "offline" : "online"}">${event.status === "open" ? "ABERTO" : "RESOLVIDO"}</span></td>
@@ -1090,37 +1265,68 @@
   }
 
   function renderReportsPage() {
-    const report = asArray(state.report);
-    const avg = report.length ? report.reduce((sum, item) => sum + Number(item.availability_24h || 0), 0) / report.length : 0;
-    const down = report.reduce((sum, item) => sum + Number(item.down_seconds_24h || 0), 0);
+    const report = reportRows();
+    const summary = state.report?.summary || {};
+    const avg = Number(summary.availability_percent || (report.length ? report.reduce((sum, item) => sum + Number(item.availability_percent || 0), 0) / report.length : 0));
+    const down = Number(summary.total_down_seconds || report.reduce((sum, item) => sum + Number(item.down_seconds || 0), 0));
     return `
       <div class="metric-grid">
-        <article class="metric-card"><div class="metric-icon green">SLA</div><div><div class="metric-label">Media 24h</div><div class="metric-value">${avg.toFixed(2)}%</div><div class="metric-help">Disponibilidade media</div></div></article>
-        <article class="metric-card"><div class="metric-icon red">DOWN</div><div><div class="metric-label">Indisponibilidade</div><div class="metric-value">${formatDuration(down)}</div><div class="metric-help">Soma em 24h</div></div></article>
-        <article class="metric-card"><div class="metric-icon amber">INC</div><div><div class="metric-label">Incidentes abertos</div><div class="metric-value">${report.filter((item) => item.open_incident).length}</div><div class="metric-help">Ativos com queda aberta</div></div></article>
+        <article class="metric-card"><div class="metric-icon green">SLA</div><div><div class="metric-label">Disponibilidade</div><div class="metric-value">${avg.toFixed(2)}%</div><div class="metric-help">Periodo filtrado</div></div></article>
+        <article class="metric-card"><div class="metric-icon red">DOWN</div><div><div class="metric-label">Indisponibilidade</div><div class="metric-value">${formatDuration(down)}</div><div class="metric-help">Soma no periodo</div></div></article>
+        <article class="metric-card"><div class="metric-icon amber">INC</div><div><div class="metric-label">Incidentes abertos</div><div class="metric-value">${Number(summary.open_incidents || report.filter((item) => item.open_incident).length)}</div><div class="metric-help">Ativos com queda aberta</div></div></article>
         <article class="metric-card"><div class="metric-icon">REP</div><div><div class="metric-label">Ativos avaliados</div><div class="metric-value">${report.length}</div><div class="metric-help">Base do relatorio</div></div></article>
       </div>
       <section class="table-panel">
         <div class="section-header" style="padding: 18px 18px 0;">
           <h2 class="section-title">Relatorio de disponibilidade por ativo</h2>
-          <button class="button" data-action="refresh-report">Atualizar</button>
+          <div class="filters">
+            <select class="select" data-report-filter="device">${deviceOptions(state.reportFilters.device, "Todos os dispositivos")}</select>
+            <input class="input compact-date" type="datetime-local" data-report-filter="from" value="${escapeHtml(state.reportFilters.from)}">
+            <input class="input compact-date" type="datetime-local" data-report-filter="to" value="${escapeHtml(state.reportFilters.to)}">
+            <button class="button" data-action="refresh-report">Filtrar</button>
+            <button class="button primary" data-action="download-report">Baixar Excel</button>
+            ${isAdmin() ? `<button class="button danger" data-action="clear-reports">Limpar relatorios</button>` : ""}
+          </div>
+        </div>
+        <div class="report-strip">
+          <span><strong>${formatDuration(summary.total_up_seconds || 0)}</strong> online</span>
+          <span><strong>${formatDuration(summary.total_down_seconds || 0)}</strong> offline</span>
+          <span><strong>${Number(summary.attention || 0)}</strong> em atencao</span>
+          <span><strong>${Number(summary.events || 0)}</strong> evento(s)</span>
         </div>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Ativo</th><th>Host</th><th>Metodo</th><th>Disponibilidade 24h</th><th>Down 24h</th><th>Incidente</th></tr></thead>
+            <thead><tr><th>Ativo</th><th>Host</th><th>Metodo</th><th>Disponibilidade</th><th>Online</th><th>Offline</th><th>MTTR</th><th>Atencao</th><th>Incidente</th></tr></thead>
             <tbody>
               ${report.map((row) => `
                 <tr>
-                  <td><div class="device-name">${deviceIcon(row.type)}<span>${escapeHtml(row.name)}</span></div></td>
-                  <td>${escapeHtml(row.host)}</td>
+                  <td><div class="device-name">${deviceIcon(row.type)}<span>${escapeHtml(row.name)}</span></div><div class="mini-text">${escapeHtml([row.serial_number, row.asset_tag, row.model].filter(Boolean).join(" - "))}</div></td>
+                  <td>${escapeHtml(row.host)}<div class="mini-text">${escapeHtml(row.location || "-")}</div></td>
                   <td><span class="badge inactive">${escapeHtml(methodLabel(row.check_method))}</span></td>
-                  <td><strong>${Number(row.availability_24h || 0).toFixed(2)}%</strong></td>
-                  <td>${formatDuration(row.down_seconds_24h || 0)}</td>
+                  <td><strong>${Number(row.availability_percent || 0).toFixed(2)}%</strong></td>
+                  <td>${formatDuration(row.up_seconds || 0)}</td>
+                  <td>${formatDuration(row.down_seconds || 0)}</td>
+                  <td>${formatDuration(row.mttr_seconds || 0)}</td>
+                  <td><span class="badge ${row.attention_level === "critica" ? "critical" : row.attention_level === "alta" ? "high" : row.attention_level === "media" ? "medium" : "low"}">${escapeHtml(row.attention_label || "Normal")}</span></td>
                   <td>${row.open_incident ? `<span class="badge offline">ABERTO</span>` : `<span class="badge online">OK</span>`}</td>
                 </tr>
-              `).join("") || `<tr><td colspan="6"><div class="empty-state">Sem dados de relatorio.</div></td></tr>`}
+              `).join("") || `<tr><td colspan="9"><div class="empty-state">Sem dados de relatorio.</div></td></tr>`}
             </tbody>
           </table>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="section-header">
+          <h2 class="section-title">Arquivos gerados</h2>
+          <span class="mini-text">${asArray(state.reportSnapshots).length} registro(s)</span>
+        </div>
+        <div class="snapshot-grid">
+          ${asArray(state.reportSnapshots).slice(0, 8).map((item) => `
+            <article class="mini-panel">
+              <div class="mini-title">${escapeHtml(item.kind)}</div>
+              <div class="mini-text">${formatDate(item.created_at)} - ${Number(item.row_count || 0)} linha(s)</div>
+            </article>
+          `).join("") || `<div class="empty-state">Nenhum arquivo gerado ainda.</div>`}
         </div>
       </section>
     `;
@@ -1192,7 +1398,7 @@
     const isSelf = state.auth.user && state.auth.user.id === user.id;
     return `
       <tr>
-        <td><strong>${escapeHtml(user.name)}</strong>${isSelf ? ` <span class="badge inactive">VOCE</span>` : ""}</td>
+        <td><div class="user-inline">${renderAvatar(user)}<strong>${escapeHtml(user.name)}</strong>${isSelf ? ` <span class="badge inactive">VOCE</span>` : ""}</div></td>
         <td>${escapeHtml(user.email)}</td>
         <td><span class="badge ${user.role === "admin" ? "critical" : user.role === "operator" ? "high" : "low"}">${roleLabel(user.role)}</span></td>
         <td><span class="badge ${user.status === "active" ? "online" : "inactive"}">${user.status === "active" ? "ATIVO" : "INATIVO"}</span></td>
@@ -1211,12 +1417,27 @@
     if (!isAdmin()) {
       return `<section class="panel">Apenas administradores podem acessar auditoria.</section>`;
     }
+    const rows = auditRows().length ? auditRows() : asArray(state.audit);
+    const summary = state.auditReport?.summary || {};
 
     return `
+      <div class="metric-grid">
+        <article class="metric-card"><div class="metric-icon">AUD</div><div><div class="metric-label">Registros</div><div class="metric-value">${Number(summary.entries || rows.length)}</div><div class="metric-help">Periodo filtrado</div></div></article>
+        <article class="metric-card"><div class="metric-icon red">FAIL</div><div><div class="metric-label">Falhas login</div><div class="metric-value">${Number(summary.failed_logins || 0)}</div><div class="metric-help">Tentativas invalidas</div></div></article>
+        <article class="metric-card"><div class="metric-icon amber">CSRF</div><div><div class="metric-label">CSRF bloqueado</div><div class="metric-value">${Number(summary.blocked_csrf || 0)}</div><div class="metric-help">Escritas recusadas</div></div></article>
+        <article class="metric-card"><div class="metric-icon green">USR</div><div><div class="metric-label">Usuarios</div><div class="metric-value">${Number(summary.users || 0)}</div><div class="metric-help">Com eventos</div></div></article>
+      </div>
       <section class="table-panel">
         <div class="section-header" style="padding: 18px 18px 0;">
           <h2 class="section-title">Auditoria de seguranca</h2>
-          <button class="button" data-action="refresh-audit">Atualizar</button>
+          <div class="filters">
+            <select class="select" data-audit-filter="user">${[`<option value="all"${state.auditFilters.user === "all" ? " selected" : ""}>Todos os usuarios</option>`].concat(asArray(state.users).map((user) => `<option value="${escapeHtml(user.id)}"${state.auditFilters.user === user.id ? " selected" : ""}>${escapeHtml(user.name)}</option>`)).join("")}</select>
+            <input class="input" data-audit-filter="action" placeholder="Acao..." value="${escapeHtml(state.auditFilters.action)}">
+            <input class="input compact-date" type="datetime-local" data-audit-filter="from" value="${escapeHtml(state.auditFilters.from)}">
+            <input class="input compact-date" type="datetime-local" data-audit-filter="to" value="${escapeHtml(state.auditFilters.to)}">
+            <button class="button" data-action="refresh-audit">Filtrar</button>
+            <button class="button primary" data-action="download-audit">Baixar Excel</button>
+          </div>
         </div>
         <div class="table-scroll">
           <table>
@@ -1230,7 +1451,7 @@
               </tr>
             </thead>
             <tbody>
-              ${asArray(state.audit).map((row) => `
+              ${rows.map((row) => `
                 <tr>
                   <td>${formatDate(row.created_at)}</td>
                   <td>${escapeHtml(row.user_name || "Sistema")}</td>
@@ -1300,9 +1521,19 @@
           <div class="field"><label>Retencao de auditoria (dias)</label><input class="input" name="audit_retention_days" type="number" min="1" value="${settings.audit_retention_days}"></div>
           <div class="field"><label>Retencao de eventos (dias)</label><input class="input" name="event_retention_days" type="number" min="1" value="${settings.event_retention_days}"></div>
           <div class="field"><label>Retencao de backup (dias)</label><input class="input" name="backup_retention_days" type="number" min="1" value="${settings.backup_retention_days}"></div>
+          <div class="field"><label>Bipe critico apos (min)</label><input class="input" name="critical_sound_minutes" type="number" min="1" value="${settings.critical_sound_minutes}"></div>
+          <div class="field"><label>Tema padrao</label><select class="select" name="ui_theme">
+            <option value="system"${settings.ui_theme === "system" ? " selected" : ""}>Sistema</option>
+            <option value="light"${settings.ui_theme === "light" ? " selected" : ""}>Claro</option>
+            <option value="dark"${settings.ui_theme === "dark" ? " selected" : ""}>Escuro</option>
+            <option value="blackout"${settings.ui_theme === "blackout" ? " selected" : ""}>Blackout</option>
+            <option value="steel"${settings.ui_theme === "steel" ? " selected" : ""}>Steel</option>
+            <option value="contrast"${settings.ui_theme === "contrast" ? " selected" : ""}>Contraste</option>
+          </select></div>
           <div class="field full">
             <label class="checkbox-field"><input type="checkbox" name="require_csrf" ${settings.require_csrf ? "checked" : ""}> Exigir token anti-CSRF nas acoes de escrita</label>
             <label class="checkbox-field"><input type="checkbox" name="allow_viewer_export" ${settings.allow_viewer_export ? "checked" : ""}> Permitir exportacao para visualizadores</label>
+            <label class="checkbox-field"><input type="checkbox" name="critical_sound_enabled" ${settings.critical_sound_enabled ? "checked" : ""}> Ativar bipe para criticidade alta prolongada</label>
           </div>
           <div class="field full"><button class="button primary" type="submit">Salvar configuracoes</button></div>
         </form>
@@ -1324,6 +1555,9 @@
       owner: "",
       tags: "",
       notes: "",
+      serial_number: "",
+      asset_tag: "",
+      model: "",
       maintenance_until: "",
       is_active: true
     };
@@ -1394,6 +1628,18 @@
               <input class="input" id="tags" name="tags" value="${escapeHtml(device.tags || "")}" placeholder="erp, matriz, windows">
             </div>
             <div class="field">
+              <label for="serial_number">Numero serial</label>
+              <input class="input" id="serial_number" name="serial_number" value="${escapeHtml(device.serial_number || "")}" placeholder="Serial, service tag ou SN">
+            </div>
+            <div class="field">
+              <label for="asset_tag">Patrimonio</label>
+              <input class="input" id="asset_tag" name="asset_tag" value="${escapeHtml(device.asset_tag || "")}" placeholder="Etiqueta interna">
+            </div>
+            <div class="field">
+              <label for="model">Modelo</label>
+              <input class="input" id="model" name="model" value="${escapeHtml(device.model || "")}" placeholder="Fabricante / modelo">
+            </div>
+            <div class="field">
               <label for="maintenance_until">Manutencao ate</label>
               <input class="input" id="maintenance_until" name="maintenance_until" type="datetime-local" value="${toDateTimeLocal(device.maintenance_until)}">
               <div class="field-help">Enquanto estiver em manutencao, o Sword pausa a checagem automatica.</div>
@@ -1424,7 +1670,8 @@
       name: "",
       email: "",
       role: "viewer",
-      status: "active"
+      status: "active",
+      avatar_data_url: ""
     };
     const isEdit = Boolean(user.id);
 
@@ -1463,6 +1710,14 @@
               <label for="user-password">${isEdit ? "Nova senha" : "Senha"}</label>
               <input class="input" id="user-password" name="password" type="password" ${isEdit ? "" : "required"} minlength="6" autocomplete="new-password">
               <div class="field-help">${isEdit ? "Deixe em branco para manter a senha atual." : "Minimo de 6 caracteres."}</div>
+            </div>
+            <div class="field full">
+              <label for="user-avatar">Foto do usuario</label>
+              <div class="avatar-field">
+                ${renderAvatar(user)}
+                <input class="input" id="user-avatar" name="avatar" type="file" accept="image/png,image/jpeg,image/webp">
+              </div>
+              <div class="field-help">PNG, JPG ou WEBP ate 250 KB.</div>
             </div>
           </div>
           <div class="modal-footer">
@@ -1574,6 +1829,13 @@
             setToast(error.message);
           }
         }
+        if (state.view === "history") {
+          try {
+            await loadHistoryReport();
+          } catch (error) {
+            setToast(error.message);
+          }
+        }
         if (state.view === "reports" || state.view === "operation") {
           try {
             await loadReport();
@@ -1616,6 +1878,29 @@
         render();
       });
     });
+
+    app.querySelectorAll("[data-report-filter]").forEach((field) => {
+      field.addEventListener("change", () => {
+        state.reportFilters[field.dataset.reportFilter] = field.value;
+      });
+    });
+
+    app.querySelectorAll("[data-audit-filter]").forEach((field) => {
+      field.addEventListener("input", () => {
+        state.auditFilters[field.dataset.auditFilter] = field.value;
+      });
+      field.addEventListener("change", () => {
+        state.auditFilters[field.dataset.auditFilter] = field.value;
+      });
+    });
+
+    const themeSelect = app.querySelector("[data-theme-select]");
+    if (themeSelect) {
+      themeSelect.addEventListener("change", () => {
+        applyTheme(themeSelect.value);
+        render();
+      });
+    }
 
     app.querySelectorAll("[data-action]").forEach((button) => {
       button.addEventListener("click", handleAction);
@@ -1667,6 +1952,13 @@
         render();
       }
 
+      if (action === "test-sound") {
+        state.soundArmed = true;
+        state.lastBeepAt = 0;
+        playCriticalBeep();
+        setToast("Bipe de alerta testado.");
+      }
+
       if (action === "logout") {
         await api.post("/api/auth/logout");
         state.auth.user = null;
@@ -1691,6 +1983,49 @@
         await loadReport();
         setToast("Relatorio atualizado.");
         render();
+      }
+
+      if (action === "apply-history-report") {
+        await loadHistoryReport();
+        setToast("Historico filtrado.");
+        render();
+      }
+
+      if (action === "download-report") {
+        downloadUrl(`/api/reports/availability/export${buildQuery(state.reportFilters, "report")}`);
+        await loadReport();
+        setToast("Relatorio preparado para Excel.");
+      }
+
+      if (action === "download-history") {
+        downloadUrl(`/api/history/export${buildQuery(state.historyFilters, "history")}`);
+        await loadHistoryReport();
+        setToast("Historico preparado para Excel.");
+      }
+
+      if (action === "download-audit") {
+        downloadUrl(`/api/audit/export${buildQuery(state.auditFilters, "audit")}`);
+        await loadAudit();
+        setToast("Auditoria preparada para Excel.");
+      }
+
+      if (action === "clear-history") {
+        if (window.confirm("Limpar historico resolvido? Incidentes abertos serao preservados.")) {
+          await api.delete("/api/events?scope=resolved");
+          await loadData({ silent: true });
+          await loadHistoryReport();
+          setToast("Historico resolvido limpo.");
+          render();
+        }
+      }
+
+      if (action === "clear-reports") {
+        if (window.confirm("Limpar a lista de relatorios gerados?")) {
+          await api.delete("/api/report-snapshots");
+          await loadReport();
+          setToast("Relatorios gerados limpos.");
+          render();
+        }
       }
 
       if (action === "create-backup") {
@@ -1878,6 +2213,9 @@
       owner: form.get("owner"),
       tags: form.get("tags"),
       notes: form.get("notes"),
+      serial_number: form.get("serial_number"),
+      asset_tag: form.get("asset_tag"),
+      model: form.get("model"),
       maintenance_until: form.get("maintenance_until"),
       is_active: form.get("is_active") === "on"
     };
@@ -1917,6 +2255,11 @@
     }
 
     try {
+      const avatarFile = event.currentTarget.querySelector('input[name="avatar"]')?.files?.[0];
+      const avatarData = await readFileAsDataUrl(avatarFile);
+      if (avatarData) {
+        payload.avatar_data_url = avatarData;
+      }
       if (state.userModal.user && state.userModal.user.id) {
         await api.put(`/api/users/${state.userModal.user.id}`, payload);
         setToast("Usuario atualizado.");
@@ -1927,6 +2270,8 @@
       }
       state.userModal = null;
       await loadUsers();
+      const current = asArray(state.users).find((user) => state.auth.user && user.id === state.auth.user.id);
+      if (current) state.auth.user = current;
       render();
     } catch (error) {
       setToast(error.message);
@@ -1974,12 +2319,16 @@
       audit_retention_days: Number(form.get("audit_retention_days")),
       event_retention_days: Number(form.get("event_retention_days")),
       backup_retention_days: Number(form.get("backup_retention_days")),
+      critical_sound_minutes: Number(form.get("critical_sound_minutes")),
+      ui_theme: form.get("ui_theme"),
       require_csrf: form.get("require_csrf") === "on",
-      allow_viewer_export: form.get("allow_viewer_export") === "on"
+      allow_viewer_export: form.get("allow_viewer_export") === "on",
+      critical_sound_enabled: form.get("critical_sound_enabled") === "on"
     };
 
     try {
       state.settings = asSettings(await api.put("/api/settings", payload));
+      applyTheme(state.settings.ui_theme || state.theme);
       await loadSecurityData();
       setToast("Configuracoes salvas.");
       render();

@@ -2,6 +2,16 @@
 
 Todas as versoes publicas do Sword listadas aqui foram criadas por Lucas Lima (LucasLimaSzDev).
 
+## v5.0 - 5.0
+
+Versao focada em relatorios, exportacoes, temas e refinamento operacional.
+
+- Relatorios por periodo e dispositivo.
+- Exportacoes CSV compativeis com Excel.
+- Historico e auditoria filtraveis e exportaveis.
+- Temas visuais, foto de usuario e bipe critico.
+- Campos adicionais para patrimonio, serial e modelo.
+
 ## v4.0 - 4.0
 
 Versao operacional com metodos de monitoramento, relatorios e integracoes.

@@ -28,6 +28,9 @@ function Get-DefaultSettings {
     check_timeout_ms = $TimeoutMs
     require_csrf = $true
     allow_viewer_export = $false
+    critical_sound_enabled = $true
+    critical_sound_minutes = 5
+    ui_theme = "system"
     updated_at = Get-NowIso
   }
 }
@@ -84,6 +87,7 @@ function Read-Store {
   $store | Add-Member -NotePropertyName audit_logs -NotePropertyValue @(Get-CleanArray $store.audit_logs) -Force
   $store | Add-Member -NotePropertyName integrations -NotePropertyValue @(Get-CleanArray $store.integrations) -Force
   $store | Add-Member -NotePropertyName integration_deliveries -NotePropertyValue @(Get-CleanArray $store.integration_deliveries) -Force
+  $store | Add-Member -NotePropertyName report_snapshots -NotePropertyValue @(Get-CleanArray $store.report_snapshots) -Force
   if ($null -eq $store.settings) {
     $store | Add-Member -NotePropertyName settings -NotePropertyValue (Get-DefaultSettings) -Force
   }
@@ -101,7 +105,13 @@ function Read-Store {
     if ($null -eq $device.owner) { $device | Add-Member -NotePropertyName owner -NotePropertyValue "" -Force }
     if ($null -eq $device.tags) { $device | Add-Member -NotePropertyName tags -NotePropertyValue "" -Force }
     if ($null -eq $device.notes) { $device | Add-Member -NotePropertyName notes -NotePropertyValue "" -Force }
+    if ($null -eq $device.serial_number) { $device | Add-Member -NotePropertyName serial_number -NotePropertyValue "" -Force }
+    if ($null -eq $device.asset_tag) { $device | Add-Member -NotePropertyName asset_tag -NotePropertyValue "" -Force }
+    if ($null -eq $device.model) { $device | Add-Member -NotePropertyName model -NotePropertyValue "" -Force }
     if ($null -eq $device.maintenance_until) { $device | Add-Member -NotePropertyName maintenance_until -NotePropertyValue $null -Force }
+  }
+  foreach ($user in @(Get-CleanArray $store.users)) {
+    if ($null -eq $user.avatar_data_url) { $user | Add-Member -NotePropertyName avatar_data_url -NotePropertyValue "" -Force }
   }
   return $store
 }
@@ -115,6 +125,7 @@ function Save-Store($Store) {
   $Store | Add-Member -NotePropertyName audit_logs -NotePropertyValue @(Get-CleanArray $Store.audit_logs) -Force
   $Store | Add-Member -NotePropertyName integrations -NotePropertyValue @(Get-CleanArray $Store.integrations) -Force
   $Store | Add-Member -NotePropertyName integration_deliveries -NotePropertyValue @(Get-CleanArray $Store.integration_deliveries) -Force
+  $Store | Add-Member -NotePropertyName report_snapshots -NotePropertyValue @(Get-CleanArray $Store.report_snapshots) -Force
   if ($null -eq $Store.settings) {
     $Store | Add-Member -NotePropertyName settings -NotePropertyValue (Get-DefaultSettings) -Force
   }
@@ -201,6 +212,12 @@ function Send-JsonArray($Context, $Items, [int]$StatusCode = 200, [string[]]$Ext
 
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
   Send-Raw $Context $bytes "application/json; charset=utf-8" $StatusCode $ExtraHeaders
+}
+
+function Send-DownloadText($Context, [string]$Text, [string]$ContentType, [string]$FileName) {
+  $safeName = "$FileName" -replace '[^A-Za-z0-9_.-]', "_"
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+  Send-Raw $Context $bytes $ContentType 200 @("Content-Disposition: attachment; filename=""$safeName""")
 }
 
 function Send-Text($Context, [string]$Text, [int]$StatusCode = 200) {
@@ -441,6 +458,7 @@ function Get-PublicUser($User) {
     email = $User.email
     role = $User.role
     status = $User.status
+    avatar_data_url = if ($null -eq $User.avatar_data_url) { "" } else { $User.avatar_data_url }
     created_at = $User.created_at
     updated_at = $User.updated_at
     last_login_at = $User.last_login_at
@@ -466,6 +484,9 @@ function Get-PublicSettings($Settings) {
     check_timeout_ms = [int]$Settings.check_timeout_ms
     require_csrf = [bool]$Settings.require_csrf
     allow_viewer_export = [bool]$Settings.allow_viewer_export
+    critical_sound_enabled = [bool]$Settings.critical_sound_enabled
+    critical_sound_minutes = [int]$Settings.critical_sound_minutes
+    ui_theme = if ([string]::IsNullOrWhiteSpace($Settings.ui_theme)) { "system" } else { $Settings.ui_theme }
     updated_at = $Settings.updated_at
   }
 }
@@ -699,6 +720,14 @@ function Get-UserBodyError($Body, [bool]$IsCreate) {
     return "Status de usuario invalido."
   }
 
+  if ($null -ne $Body.avatar_data_url -and "$($Body.avatar_data_url)".Length -gt 250000) {
+    return "Foto do usuario deve ter ate 250 KB."
+  }
+
+  if ($null -ne $Body.avatar_data_url -and -not [string]::IsNullOrWhiteSpace($Body.avatar_data_url) -and "$($Body.avatar_data_url)" -notmatch "^data:image/(png|jpeg|jpg|webp);base64,") {
+    return "Foto do usuario deve ser PNG, JPG ou WEBP."
+  }
+
   return $null
 }
 
@@ -707,7 +736,7 @@ function Get-SettingsBodyError($Body) {
     return "Corpo da requisicao invalido."
   }
 
-  foreach ($field in @("session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms")) {
+  foreach ($field in @("session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms", "critical_sound_minutes")) {
     if ($null -ne $Body.$field) {
       $value = [int]$Body.$field
       if ($value -lt 1 -or $value -gt 100000) {
@@ -718,6 +747,10 @@ function Get-SettingsBodyError($Body) {
 
   if ($null -ne $Body.app_name -and ("$($Body.app_name)".Trim().Length -lt 1 -or "$($Body.app_name)".Trim().Length -gt 40)) {
     return "Nome da aplicacao deve ter ate 40 caracteres."
+  }
+
+  if ($null -ne $Body.ui_theme -and -not (Test-AllowedValue "$($Body.ui_theme)" @("system", "light", "dark", "blackout", "steel", "contrast"))) {
+    return "Tema invalido."
   }
 
   return $null
@@ -731,6 +764,7 @@ function New-UserFromBody($Body, [string]$Now) {
     password_hash = Get-PasswordHash "$($Body.password)"
     role = "$($Body.role)".Trim().ToLowerInvariant()
     status = "active"
+    avatar_data_url = if ([string]::IsNullOrWhiteSpace($Body.avatar_data_url)) { "" } else { "$($Body.avatar_data_url)".Trim() }
     created_at = $Now
     updated_at = $Now
     last_login_at = $null
@@ -764,6 +798,59 @@ function Get-SessionCookieHeader([string]$Token, [int]$Hours = 8) {
 
 function Get-ClearSessionCookieHeader {
   return "Set-Cookie: sword_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+}
+
+function Get-QueryValue($Request, [string]$Name, [string]$Default = "") {
+  $query = "$($Request.Url.Query)"
+  if ([string]::IsNullOrWhiteSpace($query)) {
+    return $Default
+  }
+
+  foreach ($part in @($query.TrimStart("?").Split("&", [System.StringSplitOptions]::RemoveEmptyEntries))) {
+    $pair = @($part -split "=", 2)
+    $key = [uri]::UnescapeDataString($pair[0])
+    if ($key -eq $Name) {
+      if ($pair.Count -eq 1) { return "" }
+      return [uri]::UnescapeDataString($pair[1].Replace("+", " "))
+    }
+  }
+
+  return $Default
+}
+
+function Get-ReportRange($Request) {
+  $now = Get-Date
+  $fromText = Get-QueryValue $Request "from" ""
+  $toText = Get-QueryValue $Request "to" ""
+  $from = if ([string]::IsNullOrWhiteSpace($fromText)) { $now.AddHours(-24) } else { [datetime]::Parse($fromText) }
+  $to = if ([string]::IsNullOrWhiteSpace($toText)) { $now } else { [datetime]::Parse($toText) }
+  if ($to -lt $from) {
+    $tmp = $from
+    $from = $to
+    $to = $tmp
+  }
+  return [pscustomobject]@{ From = $from; To = $to }
+}
+
+function ConvertTo-CsvText($Rows) {
+  $items = @(Get-CleanArray $Rows)
+  if ($items.Count -eq 0) {
+    return ""
+  }
+  return (@($items | ConvertTo-Csv -NoTypeInformation) -join "`r`n")
+}
+
+function New-ReportSnapshot($Store, $User, [string]$Kind, $Filters, [int]$RowCount) {
+  $snapshot = [pscustomobject][ordered]@{
+    id = New-EntityId "rpt"
+    kind = $Kind
+    filters = $Filters
+    row_count = $RowCount
+    created_by = if ($null -eq $User) { $null } else { $User.id }
+    created_at = Get-NowIso
+  }
+  $Store.report_snapshots = @(@(Get-CleanArray $Store.report_snapshots) + $snapshot | Select-Object -Last 100)
+  return $snapshot
 }
 
 function Get-DeviceBodyError($Body, [bool]$IsCreate) {
@@ -827,7 +914,7 @@ function Get-DeviceBodyError($Body, [bool]$IsCreate) {
     }
   }
 
-  foreach ($field in @("type", "location", "owner", "tags")) {
+  foreach ($field in @("type", "location", "owner", "tags", "serial_number", "asset_tag", "model")) {
     if ($null -ne $Body.$field -and "$($Body.$field)".Length -gt 120) {
       return "Campo $field deve ter ate 120 caracteres."
     }
@@ -1052,38 +1139,255 @@ function Get-Summary($Store) {
   }
 }
 
-function Get-AvailabilityReport($Store) {
-  $now = Get-Date
-  $periodStart = $now.AddHours(-24)
-  $periodSeconds = [math]::Max(1, ($now - $periodStart).TotalSeconds)
+function Get-ReportDevices($Store, [string]$DeviceId) {
+  $devices = @(Get-CleanArray $Store.devices)
+  if (-not [string]::IsNullOrWhiteSpace($DeviceId) -and $DeviceId -ne "all") {
+    $devices = @($devices | Where-Object { $_.id -eq $DeviceId })
+  }
+  return $devices
+}
 
-  return @(Get-CleanArray $Store.devices) | ForEach-Object {
-    $device = $_
-    $events = @(Get-CleanArray $Store.status_events | Where-Object { $_.device_id -eq $device.id })
+function Get-EventsInRange($Store, [datetime]$From, [datetime]$To, [string]$DeviceId = "") {
+  return @(Get-CleanArray $Store.status_events) | Where-Object {
+    if ([string]::IsNullOrWhiteSpace($_.down_at)) {
+      $false
+    } else {
+      $downAt = [datetime]::Parse($_.down_at)
+      $upAt = if ([string]::IsNullOrWhiteSpace($_.up_at)) { $To } else { [datetime]::Parse($_.up_at) }
+      $matchesDevice = [string]::IsNullOrWhiteSpace($DeviceId) -or $DeviceId -eq "all" -or $_.device_id -eq $DeviceId
+      $matchesDevice -and $downAt -le $To -and $upAt -ge $From
+    }
+  }
+}
+
+function Get-AttentionAssessment($Device, [double]$Availability, [int]$DownSeconds, [bool]$OpenIncident) {
+  $criticality = "$($Device.criticality)".ToLowerInvariant()
+  if ($OpenIncident -and $criticality -in @("alta", "critica")) {
+    return [pscustomobject]@{ level = "critica"; label = "Atencao imediata"; reason = "Ativo critico offline agora." }
+  }
+  if ($Availability -lt 95) {
+    return [pscustomobject]@{ level = "alta"; label = "Investigar"; reason = "Disponibilidade abaixo de 95% no periodo." }
+  }
+  if ($Availability -lt 99 -or $DownSeconds -gt 0) {
+    return [pscustomobject]@{ level = "media"; label = "Acompanhar"; reason = "Houve indisponibilidade no periodo." }
+  }
+  return [pscustomobject]@{ level = "baixa"; label = "Normal"; reason = "Sem queda relevante no periodo." }
+}
+
+function Get-AvailabilityReport($Store, $Request = $null) {
+  $range = if ($null -eq $Request) { [pscustomobject]@{ From = (Get-Date).AddHours(-24); To = Get-Date } } else { Get-ReportRange $Request }
+  $deviceId = if ($null -eq $Request) { "" } else { Get-QueryValue $Request "device_id" "" }
+  $devices = @(Get-ReportDevices $Store $deviceId)
+  $periodSeconds = [math]::Max(1, ($range.To - $range.From).TotalSeconds)
+  $rows = @()
+
+  foreach ($device in $devices) {
+    $events = @(Get-EventsInRange $Store $range.From $range.To $device.id)
     $downSeconds = 0
+    $resolvedDurations = @()
+
     foreach ($event in $events) {
       $downAt = [datetime]::Parse($event.down_at)
-      $upAt = if ($null -eq $event.up_at) { $now } else { [datetime]::Parse($event.up_at) }
-      if ($upAt -gt $periodStart) {
-        $start = if ($downAt -lt $periodStart) { $periodStart } else { $downAt }
-        $end = if ($upAt -gt $now) { $now } else { $upAt }
-        $downSeconds += [math]::Max(0, ($end - $start).TotalSeconds)
+      $upAt = if ([string]::IsNullOrWhiteSpace($event.up_at)) { $range.To } else { [datetime]::Parse($event.up_at) }
+      $start = if ($downAt -lt $range.From) { $range.From } else { $downAt }
+      $end = if ($upAt -gt $range.To) { $range.To } else { $upAt }
+      $duration = [int][math]::Max(0, ($end - $start).TotalSeconds)
+      $downSeconds += $duration
+      if (-not [string]::IsNullOrWhiteSpace($event.up_at)) {
+        $resolvedDurations += [int][math]::Max(0, ([datetime]::Parse($event.up_at) - [datetime]::Parse($event.down_at)).TotalSeconds)
       }
     }
+
+    $upSeconds = [int][math]::Max(0, $periodSeconds - $downSeconds)
     $availability = [math]::Round([math]::Max(0, (1 - ($downSeconds / $periodSeconds)) * 100), 2)
-    [pscustomobject][ordered]@{
+    $openIncident = $null -ne (Get-OpenEvent $Store $device.id)
+    $assessment = Get-AttentionAssessment $device $availability ([int]$downSeconds) $openIncident
+    $mttr = if (@($resolvedDurations).Count -gt 0) { [int]([math]::Round((@($resolvedDurations) | Measure-Object -Average).Average, 0)) } else { 0 }
+
+    $rows += [pscustomobject][ordered]@{
       device_id = $device.id
       name = $device.name
       host = $device.host
       type = $device.type
+      location = $device.location
       criticality = $device.criticality
       current_status = $device.current_status
       check_method = if ([string]::IsNullOrWhiteSpace($device.check_method)) { "ping" } else { $device.check_method }
+      serial_number = if ($null -eq $device.serial_number) { "" } else { $device.serial_number }
+      asset_tag = if ($null -eq $device.asset_tag) { "" } else { $device.asset_tag }
+      model = if ($null -eq $device.model) { "" } else { $device.model }
+      last_check_at = $device.last_check_at
+      events_count = @($events).Count
+      down_count = @($events | Where-Object { $_.down_at }).Count
+      up_count = @($events | Where-Object { -not [string]::IsNullOrWhiteSpace($_.up_at) }).Count
+      down_seconds = [int]$downSeconds
+      up_seconds = $upSeconds
+      mttr_seconds = $mttr
+      availability_percent = $availability
+      open_incident = $openIncident
+      attention_level = $assessment.level
+      attention_label = $assessment.label
+      attention_reason = $assessment.reason
       down_seconds_24h = [int]$downSeconds
       availability_24h = $availability
-      open_incident = $null -ne (Get-OpenEvent $Store $device.id)
     }
-  } | Sort-Object availability_24h, name
+  }
+
+  $totalDown = [int](@($rows | Measure-Object -Property down_seconds -Sum).Sum)
+  $totalUp = [int](@($rows | Measure-Object -Property up_seconds -Sum).Sum)
+  $totalPeriod = [math]::Max(1, ($periodSeconds * [math]::Max(1, @($rows).Count)))
+  $overallAvailability = [math]::Round([math]::Max(0, (1 - ($totalDown / $totalPeriod)) * 100), 2)
+
+  return [pscustomobject][ordered]@{
+    generated_at = Get-NowIso
+    from = $range.From.ToString("o")
+    to = $range.To.ToString("o")
+    device_id = $deviceId
+    summary = [pscustomobject][ordered]@{
+      devices = @($rows).Count
+      total_down_seconds = $totalDown
+      total_up_seconds = $totalUp
+      availability_percent = $overallAvailability
+      events = [int](@($rows | Measure-Object -Property events_count -Sum).Sum)
+      open_incidents = @($rows | Where-Object { $_.open_incident }).Count
+      attention = @($rows | Where-Object { $_.attention_level -in @("critica", "alta", "media") }).Count
+    }
+    rows = @($rows | Sort-Object availability_percent, name)
+  }
+}
+
+function Get-AvailabilityExportRows($Report) {
+  return @($Report.rows) | ForEach-Object {
+    [pscustomobject][ordered]@{
+      Dispositivo = $_.name
+      Host = $_.host
+      Tipo = $_.type
+      Localizacao = $_.location
+      Serial = $_.serial_number
+      Patrimonio = $_.asset_tag
+      Modelo = $_.model
+      Criticidade = $_.criticality
+      StatusAtual = $_.current_status
+      Metodo = $_.check_method
+      UltimaVerificacao = $_.last_check_at
+      Eventos = $_.events_count
+      Quedas = $_.down_count
+      Retornos = $_.up_count
+      TempoOfflineSeg = $_.down_seconds
+      TempoOnlineSeg = $_.up_seconds
+      MTTRSeg = $_.mttr_seconds
+      DisponibilidadePercentual = $_.availability_percent
+      IncidenteAberto = $_.open_incident
+      Atencao = $_.attention_label
+      Motivo = $_.attention_reason
+    }
+  }
+}
+
+function Get-HistoryReport($Store, $Request) {
+  $range = Get-ReportRange $Request
+  $deviceId = Get-QueryValue $Request "device_id" ""
+  $events = @(Get-EventsInRange $Store $range.From $range.To $deviceId)
+  $rows = @($events | Sort-Object { [datetime]::Parse($_.down_at) } -Descending | ForEach-Object {
+    $device = Get-DeviceById $Store $_.device_id
+    [pscustomobject][ordered]@{
+      event_id = $_.id
+      device_id = $_.device_id
+      device_name = if ($null -eq $device) { $_.device_id } else { $device.name }
+      host = if ($null -eq $device) { "" } else { $device.host }
+      type = if ($null -eq $device) { "" } else { $device.type }
+      location = if ($null -eq $device) { "" } else { $device.location }
+      criticality = $_.criticality
+      down_at = $_.down_at
+      up_at = $_.up_at
+      duration_seconds = if ($null -eq $_.duration_seconds) { [int][math]::Max(0, ($range.To - [datetime]::Parse($_.down_at)).TotalSeconds) } else { $_.duration_seconds }
+      status = $_.status
+      event_type = if ($_.status -eq "open") { "down_aberto" } else { "down_up_resolvido" }
+    }
+  })
+
+  return [pscustomobject][ordered]@{
+    generated_at = Get-NowIso
+    from = $range.From.ToString("o")
+    to = $range.To.ToString("o")
+    device_id = $deviceId
+    summary = [pscustomobject][ordered]@{
+      events = @($rows).Count
+      open_events = @($rows | Where-Object { $_.status -eq "open" }).Count
+      resolved_events = @($rows | Where-Object { $_.status -eq "resolved" }).Count
+      total_duration_seconds = [int](@($rows | Measure-Object -Property duration_seconds -Sum).Sum)
+    }
+    rows = $rows
+  }
+}
+
+function Get-HistoryExportRows($Report) {
+  return @($Report.rows) | ForEach-Object {
+    [pscustomobject][ordered]@{
+      Dispositivo = $_.device_name
+      Host = $_.host
+      Tipo = $_.type
+      Localizacao = $_.location
+      Criticidade = $_.criticality
+      Evento = $_.event_type
+      DownAt = $_.down_at
+      UpAt = $_.up_at
+      DuracaoSeg = $_.duration_seconds
+      Status = $_.status
+    }
+  }
+}
+
+function Get-AuditReport($Store, $Request) {
+  $range = Get-ReportRange $Request
+  $action = Get-QueryValue $Request "action" ""
+  $userId = Get-QueryValue $Request "user_id" ""
+  $rows = @(Get-CleanArray $Store.audit_logs) | Where-Object {
+    $created = [datetime]::Parse($_.created_at)
+    $matchesAction = [string]::IsNullOrWhiteSpace($action) -or "$($_.action)" -like "*$action*"
+    $matchesUser = [string]::IsNullOrWhiteSpace($userId) -or $userId -eq "all" -or $_.user_id -eq $userId
+    $created -ge $range.From -and $created -le $range.To -and $matchesAction -and $matchesUser
+  } | Sort-Object { [datetime]::Parse($_.created_at) } -Descending | ForEach-Object {
+    $user = Get-UserById $Store $_.user_id
+    [pscustomobject][ordered]@{
+      id = $_.id
+      user_id = $_.user_id
+      user_name = if ($null -eq $user) { "Sistema" } else { $user.name }
+      action = $_.action
+      entity_type = $_.entity_type
+      entity_id = $_.entity_id
+      created_at = $_.created_at
+      metadata = if ($null -eq $_.metadata) { "" } else { ($_.metadata | ConvertTo-Json -Compress -Depth 8) }
+    }
+  }
+
+  return [pscustomobject][ordered]@{
+    generated_at = Get-NowIso
+    from = $range.From.ToString("o")
+    to = $range.To.ToString("o")
+    action = $action
+    user_id = $userId
+    summary = [pscustomobject][ordered]@{
+      entries = @($rows).Count
+      users = @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace($_.user_id) } | Select-Object -ExpandProperty user_id -Unique).Count
+      blocked_csrf = @($rows | Where-Object { $_.action -eq "security.csrf.blocked" }).Count
+      failed_logins = @($rows | Where-Object { $_.action -eq "auth.login.failed" }).Count
+    }
+    rows = $rows
+  }
+}
+
+function Get-AuditExportRows($Report) {
+  return @($Report.rows) | ForEach-Object {
+    [pscustomobject][ordered]@{
+      DataHora = $_.created_at
+      Usuario = $_.user_name
+      Acao = $_.action
+      Entidade = $_.entity_type
+      EntidadeId = $_.entity_id
+      Metadados = $_.metadata
+    }
+  }
 }
 
 function New-IntegrationFromBody($Body, [string]$Now) {
@@ -1151,6 +1455,9 @@ function New-DeviceFromBody($Body, [string]$Now) {
     owner = if ([string]::IsNullOrWhiteSpace($Body.owner)) { "" } else { "$($Body.owner)".Trim() }
     tags = if ([string]::IsNullOrWhiteSpace($Body.tags)) { "" } else { "$($Body.tags)".Trim() }
     notes = if ([string]::IsNullOrWhiteSpace($Body.notes)) { "" } else { "$($Body.notes)".Trim() }
+    serial_number = if ([string]::IsNullOrWhiteSpace($Body.serial_number)) { "" } else { "$($Body.serial_number)".Trim() }
+    asset_tag = if ([string]::IsNullOrWhiteSpace($Body.asset_tag)) { "" } else { "$($Body.asset_tag)".Trim() }
+    model = if ([string]::IsNullOrWhiteSpace($Body.model)) { "" } else { "$($Body.model)".Trim() }
     maintenance_until = if ([string]::IsNullOrWhiteSpace($Body.maintenance_until)) { $null } else { "$($Body.maintenance_until)".Trim() }
     is_active = $isActive
     last_check_at = $null
@@ -1160,7 +1467,7 @@ function New-DeviceFromBody($Body, [string]$Now) {
 }
 
 function Update-DeviceFromBody($Device, $Body, [string]$Now) {
-  foreach ($field in @("name", "host", "type", "location", "criticality", "current_status", "check_method", "url_path", "owner", "tags", "notes", "maintenance_until")) {
+  foreach ($field in @("name", "host", "type", "location", "criticality", "current_status", "check_method", "url_path", "owner", "tags", "notes", "serial_number", "asset_tag", "model", "maintenance_until")) {
     if ($null -ne $Body.$field) {
       $value = "$($Body.$field)".Trim()
       if ($field -in @("criticality", "current_status", "check_method")) {
@@ -1284,7 +1591,7 @@ function Handle-ApiRequest($Context) {
     }
 
     if ($method -eq "POST" -and $path -eq "/api/auth/logout") {
-      $token = Get-CookieValue $request "monitor_session"
+      $token = Get-CookieValue $request "sword_session"
       if (-not [string]::IsNullOrWhiteSpace($token)) {
         $tokenHash = Get-TokenHash $token
         foreach ($session in @(Get-CleanArray $store.sessions)) {
@@ -1359,7 +1666,7 @@ function Handle-ApiRequest($Context) {
         return
       }
 
-      foreach ($field in @("app_name", "session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms", "require_csrf", "allow_viewer_export")) {
+      foreach ($field in @("app_name", "session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms", "require_csrf", "allow_viewer_export", "critical_sound_enabled", "critical_sound_minutes", "ui_theme")) {
         if ($null -ne $body.$field) {
           $store.settings.$field = $body.$field
         }
@@ -1379,6 +1686,28 @@ function Handle-ApiRequest($Context) {
         return
       }
       Send-JsonArray $Context (Get-AuditRows $store)
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/audit/report") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem gerar relatorio de auditoria." }) 403
+        return
+      }
+      Send-Json $Context (Get-AuditReport $store $request)
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/audit/export") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem exportar auditoria." }) 403
+        return
+      }
+      $report = Get-AuditReport $store $request
+      New-ReportSnapshot $store $currentUser "audit" ([pscustomobject]@{ from = $report.from; to = $report.to; action = $report.action; user_id = $report.user_id }) @($report.rows).Count | Out-Null
+      Add-AuditLog $store $currentUser "audit.export" "audit" "csv" ([pscustomobject]@{ rows = @($report.rows).Count })
+      Save-Store $store
+      Send-DownloadText $Context (ConvertTo-CsvText (Get-AuditExportRows $report)) "text/csv; charset=utf-8" ("sword-auditoria-{0}.csv" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
       return
     }
 
@@ -1420,7 +1749,56 @@ function Handle-ApiRequest($Context) {
     }
 
     if ($method -eq "GET" -and $path -eq "/api/reports/availability") {
-      Send-JsonArray $Context (Get-AvailabilityReport $store)
+      Send-Json $Context (Get-AvailabilityReport $store $request)
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/reports/availability/export") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator")) -and $store.settings.allow_viewer_export -ne $true) {
+        Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite exportar relatorios." }) 403
+        return
+      }
+      $report = Get-AvailabilityReport $store $request
+      New-ReportSnapshot $store $currentUser "availability" ([pscustomobject]@{ from = $report.from; to = $report.to; device_id = $report.device_id }) @($report.rows).Count | Out-Null
+      Add-AuditLog $store $currentUser "reports.availability.export" "report" "csv" ([pscustomobject]@{ rows = @($report.rows).Count })
+      Save-Store $store
+      Send-DownloadText $Context (ConvertTo-CsvText (Get-AvailabilityExportRows $report)) "text/csv; charset=utf-8" ("sword-disponibilidade-{0}.csv" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/history/report") {
+      Send-Json $Context (Get-HistoryReport $store $request)
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/history/export") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator")) -and $store.settings.allow_viewer_export -ne $true) {
+        Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite exportar historico." }) 403
+        return
+      }
+      $report = Get-HistoryReport $store $request
+      New-ReportSnapshot $store $currentUser "history" ([pscustomobject]@{ from = $report.from; to = $report.to; device_id = $report.device_id }) @($report.rows).Count | Out-Null
+      Add-AuditLog $store $currentUser "history.export" "history" "csv" ([pscustomobject]@{ rows = @($report.rows).Count })
+      Save-Store $store
+      Send-DownloadText $Context (ConvertTo-CsvText (Get-HistoryExportRows $report)) "text/csv; charset=utf-8" ("sword-historico-{0}.csv" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/report-snapshots") {
+      Send-JsonArray $Context (@(Get-CleanArray $store.report_snapshots) | Sort-Object { [datetime]::Parse($_.created_at) } -Descending)
+      return
+    }
+
+    if ($method -eq "DELETE" -and $path -eq "/api/report-snapshots") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem limpar relatorios." }) 403
+        return
+      }
+      $count = @(Get-CleanArray $store.report_snapshots).Count
+      $store.report_snapshots = @()
+      Add-AuditLog $store $currentUser "reports.clear" "report" "snapshots" ([pscustomobject]@{ count = $count })
+      Save-Store $store
+      Send-Json $Context ([pscustomobject]@{ ok = $true; removed = $count })
       return
     }
 
@@ -1570,6 +1948,7 @@ function Handle-ApiRequest($Context) {
         if ($null -ne $body.name) { $targetUser.name = "$($body.name)".Trim() }
         if ($null -ne $body.role) { $targetUser.role = "$($body.role)".Trim().ToLowerInvariant() }
         if ($null -ne $body.status) { $targetUser.status = "$($body.status)".Trim().ToLowerInvariant() }
+        if ($null -ne $body.avatar_data_url) { $targetUser.avatar_data_url = "$($body.avatar_data_url)".Trim() }
         if ($null -ne $body.password -and -not [string]::IsNullOrWhiteSpace($body.password)) {
           $targetUser.password_hash = Get-PasswordHash "$($body.password)"
         }
@@ -1713,6 +2092,30 @@ function Handle-ApiRequest($Context) {
 
     if ($method -eq "GET" -and $path -eq "/api/events") {
       Send-JsonArray $Context $store.status_events
+      return
+    }
+
+    if ($method -eq "DELETE" -and $path -eq "/api/events") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Apenas administradores podem limpar historico." }) 403
+        return
+      }
+      $scope = Get-QueryValue $request "scope" "resolved"
+      $beforeEvents = @(Get-CleanArray $store.status_events).Count
+      $beforeAlerts = @(Get-CleanArray $store.alerts).Count
+      if ($scope -eq "all") {
+        $store.status_events = @(Get-CleanArray $store.status_events | Where-Object { $_.status -eq "open" })
+        $openEventIds = @(Get-CleanArray $store.status_events | ForEach-Object { $_.id })
+        $store.alerts = @(Get-CleanArray $store.alerts | Where-Object { $_.status -eq "open" -and $openEventIds -contains $_.status_event_id })
+      } else {
+        $store.status_events = @(Get-CleanArray $store.status_events | Where-Object { $_.status -eq "open" })
+        $store.alerts = @(Get-CleanArray $store.alerts | Where-Object { $_.status -eq "open" })
+      }
+      $removedEvents = $beforeEvents - (@(Get-CleanArray $store.status_events).Count)
+      $removedAlerts = $beforeAlerts - (@(Get-CleanArray $store.alerts).Count)
+      Add-AuditLog $store $currentUser "history.clear" "history" $scope ([pscustomobject]@{ events = $removedEvents; alerts = $removedAlerts })
+      Save-Store $store
+      Send-Json $Context ([pscustomobject]@{ ok = $true; removed_events = $removedEvents; removed_alerts = $removedAlerts })
       return
     }
 

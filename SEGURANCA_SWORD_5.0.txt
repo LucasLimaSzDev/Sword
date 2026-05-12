@@ -1,0 +1,99 @@
+SWORD 5.0 - RELATORIOS, HISTORICO E QUALIDADE OPERACIONAL
+==========================================================
+
+Objetivo
+--------
+A versao 5.0 transforma o Sword em uma ferramenta mais completa para uso real:
+relatorios filtraveis, exportacoes, auditoria exportavel, temas, foto de
+usuario, cadastro patrimonial dos ativos e alerta sonoro para incidentes
+criticos prolongados.
+
+Polimento visual final
+----------------------
+- Tema escuro revisado para cobrir tabelas, modais, alertas, badges e campos.
+- Tema blackout adicionado para ambiente NOC, salas escuras e telas sempre
+  abertas.
+- Animacoes globais em cards e paineis foram removidas para evitar piscadas a
+  cada ciclo de verificacao.
+- O icone foi redesenhado para representar uma espada com lamina, guarda e cabo.
+
+Relatorios
+----------
+1. Disponibilidade
+   - Filtro por periodo e dispositivo.
+   - Calcula tempo online, tempo offline, percentual de disponibilidade,
+     quantidade de quedas, retornos, MTTR e incidente aberto.
+   - Indica se o ativo precisa de atencao com base em criticidade, incidente
+     aberto e disponibilidade do periodo.
+
+2. Historico
+   - Filtro por periodo e dispositivo.
+   - Mostra down, up, duracao, status, criticidade e dados do dispositivo.
+   - Exporta arquivo CSV compativel com Excel.
+
+3. Auditoria
+   - Filtro por periodo, usuario e acao.
+   - Mostra eventos de seguranca e operacao.
+   - Exporta arquivo CSV compativel com Excel.
+
+Limpezas seguras
+----------------
+1. Historico
+   - A limpeza remove historico resolvido.
+   - Incidentes abertos sao preservados para nao esconder problemas ativos.
+
+2. Relatorios
+   - A limpeza remove a lista de relatorios/exportacoes geradas.
+   - O calculo de relatorio continua disponivel sob demanda.
+
+Seguranca mantida
+-----------------
+- Login obrigatorio.
+- Cargos: Administrador, Operador e Visualizador.
+- Senhas com PBKDF2-SHA256 e salt individual.
+- Sessao em cookie HttpOnly e SameSite=Strict.
+- CSRF em acoes POST, PUT e DELETE.
+- Rate limit de login.
+- Auditoria de operacoes sensiveis.
+- Headers defensivos.
+- Validacao de entrada.
+- Exportacoes auditadas.
+
+Novos cuidados
+--------------
+1. Fotos de usuario
+   - Limitadas a 250 KB.
+   - Aceitam PNG, JPG/JPEG e WEBP.
+   - Como ficam no banco local, o arquivo data/store.json deve continuar
+     protegido por permissao NTFS.
+
+2. Exportacoes
+   - Relatorios, historico e auditoria podem revelar dados sensiveis.
+   - Arquivos baixados devem ser tratados como confidenciais.
+   - Evite enviar CSVs por canais abertos.
+
+3. Bipe critico
+   - O bipe e local ao navegador aberto.
+   - Ele depende de permissao/interacao do navegador para emitir som.
+   - Nao substitui integracoes formais com NOC, chamados ou mensageria.
+
+Ambiente recomendado
+--------------------
+O plano de rodar em rede fechada esta correto. Para maximizar a seguranca:
+
+- manter acesso apenas por LAN/VPN;
+- usar HTTPS quando houver acesso por outros computadores;
+- proteger o servidor com firewall;
+- executar com usuario sem privilegio administrativo;
+- restringir acesso ao data/store.json e backups;
+- manter Windows e antivirus/EDR atualizados;
+- revisar auditoria periodicamente;
+- migrar para SQLite/PostgreSQL quando virar producao plena.
+
+Resumo
+------
+Sword 5.0 entrega uma base muito mais profissional para apresentacao e uso
+interno: relatorios uteis, historico exportavel, auditoria exportavel, temas,
+cadastro patrimonial e alertas sonoros. A seguranca continua dependendo da soma
+entre aplicacao, rede fechada, HTTPS, permissoes de arquivo, backup e processo
+operacional.
