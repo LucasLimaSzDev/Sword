@@ -16,6 +16,7 @@
     devices: [],
     events: [],
     alerts: [],
+    majorIncidents: [],
     users: [],
     audit: [],
     backups: [],
@@ -31,7 +32,8 @@
       search: "",
       status: "all",
       type: "all",
-      criticality: "all"
+      criticality: "all",
+      switch: "all"
     },
     reportFilters: {
       device: "all",
@@ -54,7 +56,9 @@
     modal: null,
     userModal: null,
     passwordModal: null,
-    integrationModal: null
+    integrationModal: null,
+    incidentModal: null,
+    pendingAutoRender: false
   };
 
   const DEVICE_TYPES = [
@@ -168,7 +172,7 @@
     return {
       app_name: value?.app_name || "Sword",
       security_mode: value?.security_mode || "hardened-local",
-      session_hours: Number(value?.session_hours || 8),
+      session_hours: Number(value?.session_hours || 12),
       login_rate_limit_window_minutes: Number(value?.login_rate_limit_window_minutes || 15),
       login_rate_limit_max_attempts: Number(value?.login_rate_limit_max_attempts || 5),
       audit_retention_days: Number(value?.audit_retention_days || 180),
@@ -177,10 +181,17 @@
       check_interval_seconds: Number(value?.check_interval_seconds || 30),
       check_attempts: Number(value?.check_attempts || 3),
       check_timeout_ms: Number(value?.check_timeout_ms || 900),
+      monitor_batch_size: Number(value?.monitor_batch_size || 10),
       require_csrf: value?.require_csrf !== false,
       allow_viewer_export: Boolean(value?.allow_viewer_export),
       critical_sound_enabled: value?.critical_sound_enabled !== false,
       critical_sound_minutes: Number(value?.critical_sound_minutes || 5),
+      major_incident_enabled: value?.major_incident_enabled !== false,
+      major_incident_threshold_count: Number(value?.major_incident_threshold_count || 8),
+      major_incident_window_minutes: Number(value?.major_incident_window_minutes || 5),
+      switch_incident_enabled: value?.switch_incident_enabled !== false,
+      switch_incident_minutes: Number(value?.switch_incident_minutes || 2),
+      monitor_gap_alert_minutes: Number(value?.monitor_gap_alert_minutes || 5),
       ui_theme: value?.ui_theme || "system",
       updated_at: value?.updated_at || new Date().toISOString()
     };
@@ -190,6 +201,33 @@
     return Array.isArray(value) ? value : [];
   }
 
+  function isSwitchDevice(device) {
+    return /\bswitch\b/i.test(String(device?.type || ""));
+  }
+
+  function deviceById(id) {
+    return asArray(state.devices).find((device) => device.id === id) || null;
+  }
+
+  function switchDevices(excludeId = "") {
+    return asArray(state.devices)
+      .filter((device) => isSwitchDevice(device) && device.id !== excludeId)
+      .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "pt-BR"));
+  }
+
+  function switchLabel(id) {
+    const sw = deviceById(id);
+    if (!sw) return "";
+    return `${sw.name}${sw.host ? ` - ${sw.host}` : ""}`;
+  }
+
+  function isEditingSurfaceActive() {
+    if (state.modal || state.userModal || state.passwordModal || state.integrationModal || state.incidentModal) return true;
+    if (["security", "users", "integrations"].includes(state.view)) return true;
+    const active = document.activeElement;
+    return Boolean(active && active.closest && active.closest("form, .filters, .modal-backdrop"));
+  }
+
   function asSummary(value) {
     return {
       total: Number(value?.total || 0),
@@ -197,6 +235,7 @@
       offline: Number(value?.offline || 0),
       critical_offline: Number(value?.critical_offline || 0),
       open_alerts: Number(value?.open_alerts || 0),
+      open_major_incidents: Number(value?.open_major_incidents || 0),
       generated_at: value?.generated_at || new Date().toISOString()
     };
   }
@@ -354,6 +393,9 @@
       const critical = ["critical", "high"].includes(alert.priority) || ["critica", "alta"].includes(alert.device?.criticality);
       const age = Date.now() - new Date(alert.created_at || Date.now()).getTime();
       return critical && age >= thresholdMs;
+    }) || openMajorIncidents().some((incident) => {
+      const age = Date.now() - new Date(incident.detected_at || Date.now()).getTime();
+      return ["critical", "high"].includes(incident.severity) && age >= thresholdMs;
     });
     if (needsSound) playCriticalBeep();
   }
@@ -391,7 +433,8 @@
       const matchesStatus = state.filters.status === "all" || device.current_status === state.filters.status;
       const matchesType = state.filters.type === "all" || device.type === state.filters.type;
       const matchesCriticality = state.filters.criticality === "all" || device.criticality === state.filters.criticality;
-      return matchesSearch && matchesStatus && matchesType && matchesCriticality;
+      const matchesSwitch = state.filters.switch === "all" || device.switch_id === state.filters.switch;
+      return matchesSearch && matchesStatus && matchesType && matchesCriticality && matchesSwitch;
     });
   }
 
@@ -413,6 +456,37 @@
       .map((alert) => ({ ...alert, device: deviceById(alert.device_id) }))
       .filter((alert) => alert.device)
       .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+  }
+
+  function openMajorIncidents() {
+    return asArray(state.majorIncidents)
+      .filter((incident) => incident.status !== "resolved")
+      .sort((a, b) => new Date(b.detected_at || 0) - new Date(a.detected_at || 0));
+  }
+
+  function majorIncidentById(id) {
+    return asArray(state.majorIncidents).find((incident) => incident.id === id) || null;
+  }
+
+  function incidentStatusLabel(value) {
+    return {
+      open: "Aberto",
+      review: "Em analise",
+      resolved: "Resolvido"
+    }[value] || value || "-";
+  }
+
+  function incidentTypeLabel(value) {
+    return {
+      mass_outage: "Queda massiva",
+      switch_outage: "Switch offline",
+      power_outage: "Queda de energia",
+      network_outage: "Falha de rede",
+      internet_outage: "Falha de link",
+      sword_host_down: "Host Sword sem monitoramento",
+      maintenance: "Manutencao",
+      other: "Outro"
+    }[value] || value || "-";
   }
 
   function options(values, selected, labelAll) {
@@ -452,16 +526,18 @@
     }
 
     try {
-      const [summary, devices, events, alerts] = await Promise.all([
+      const [summary, devices, events, alerts, majorIncidents] = await Promise.all([
         api.get("/api/summary"),
         api.get("/api/devices"),
         api.get("/api/events"),
-        api.get("/api/alerts")
+        api.get("/api/alerts"),
+        api.get("/api/major-incidents")
       ]);
       state.summary = asSummary(summary);
       state.devices = asArray(devices);
       state.events = asArray(events);
       state.alerts = asArray(alerts);
+      state.majorIncidents = asArray(majorIncidents);
       if (!state.settings) {
         state.settings = asSettings(await api.get("/api/settings"));
       }
@@ -471,7 +547,12 @@
       state.error = error.message;
     } finally {
       state.loading = false;
-      render();
+      if (silent && isEditingSurfaceActive()) {
+        state.pendingAutoRender = true;
+      } else {
+        state.pendingAutoRender = false;
+        render();
+      }
     }
   }
 
@@ -563,6 +644,7 @@
       operation: ["Operacao", "Disponibilidade, metodos e prioridades"],
       devices: ["Dispositivos", "Cadastro e operacao dos ativos monitorados"],
       alerts: ["Alertas", "Ocorrencias criticas em aberto"],
+      incidents: ["Incidentes", "Falhas maiores, causa raiz e documentos"],
       history: ["Historico", "Eventos de disponibilidade e indisponibilidade"],
       reports: ["Relatorios", "Disponibilidade e SLA operacional"],
       users: ["Usuarios", "Controle de acesso e cargos"],
@@ -636,6 +718,7 @@
           ${state.userModal ? renderUserModal() : ""}
           ${state.passwordModal ? renderPasswordModal() : ""}
           ${state.integrationModal ? renderIntegrationModal() : ""}
+          ${state.incidentModal ? renderIncidentModal() : ""}
           ${state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : ""}
         </div>
       `;
@@ -719,7 +802,7 @@
   function renderSetupScreen() {
     return renderAuthShell(
       "Criar administrador",
-      "Configure o primeiro usuario com permissao total para iniciar o Sword 5.0.",
+      "Configure o primeiro usuario com permissao total para iniciar o Sword 7.0.",
       `
         <form class="auth-form" id="setup-form">
           <label>Nome<input class="input" name="name" required autocomplete="name"></label>
@@ -760,6 +843,7 @@
       ["operation", "OP", "Operacao"],
       ["devices", "DV", "Dispositivos"],
       ["alerts", "AL", "Alertas"],
+      ["incidents", "IC", "Incidentes"],
       ["history", "EV", "Historico"],
       ["reports", "RP", "Relatorios"],
       ["security", "SC", "Seguranca"]
@@ -785,6 +869,7 @@
               <span class="nav-icon">${icon}</span>
               <span class="nav-label">${label}</span>
               ${view === "alerts" && count ? `<span class="nav-badge">${count}</span>` : ""}
+              ${view === "incidents" && openMajorIncidents().length ? `<span class="nav-badge">${openMajorIncidents().length}</span>` : ""}
             </button>
           `).join("")}
         </nav>
@@ -807,6 +892,7 @@
     if (state.view === "devices") return renderDevicesPage();
     if (state.view === "operation") return renderOperationPage();
     if (state.view === "alerts") return renderAlertsPage();
+    if (state.view === "incidents") return renderMajorIncidentsPage();
     if (state.view === "history") return renderHistoryPage();
     if (state.view === "reports") return renderReportsPage();
     if (state.view === "users") return renderUsersPage();
@@ -863,12 +949,14 @@
     if (asArray(state.devices).length === 0) {
       return `
         ${renderMetrics()}
+        ${renderMajorIncidentBanner()}
         ${renderEmptyOnboarding()}
       `;
     }
 
     return `
       ${renderMetrics()}
+      ${renderMajorIncidentBanner()}
       <div class="dashboard-grid">
         <div class="stack">
           ${renderDevicesTable({ dashboard: true })}
@@ -962,6 +1050,7 @@
 
   function renderFilters() {
     const types = [...new Set(DEVICE_TYPES.concat(asArray(state.devices).map((device) => device.type).filter(Boolean)))].sort();
+    const switches = switchDevices();
     return `
       <div class="filters">
         <input class="input" data-filter="search" placeholder="Buscar dispositivo..." value="${escapeHtml(state.filters.search)}">
@@ -977,6 +1066,10 @@
           <option value="media"${state.filters.criticality === "media" ? " selected" : ""}>Media</option>
           <option value="alta"${state.filters.criticality === "alta" ? " selected" : ""}>Alta</option>
           <option value="critica"${state.filters.criticality === "critica" ? " selected" : ""}>Critica</option>
+        </select>
+        <select class="select" data-filter="switch">
+          <option value="all"${state.filters.switch === "all" ? " selected" : ""}>Todos os switches</option>
+          ${switches.map((item) => `<option value="${item.id}"${state.filters.switch === item.id ? " selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
         </select>
         ${canOperate() ? `<button class="button primary" data-action="new-device">Novo dispositivo</button>` : ""}
       </div>
@@ -1003,6 +1096,7 @@
                 <th>IP/Host</th>
                 <th>Tipo</th>
                 <th>Localizacao</th>
+                <th>Switch</th>
                 <th>Criticidade</th>
                 <th>Ultima verificacao</th>
                 <th>Status</th>
@@ -1010,7 +1104,7 @@
               </tr>
             </thead>
             <tbody>
-              ${visible.map(renderDeviceRow).join("") || `<tr><td colspan="8"><div class="empty-state">${emptyText}${canOperate() ? `<br><button class="button primary" data-action="new-device">Cadastrar dispositivo</button>` : ""}</div></td></tr>`}
+              ${visible.map(renderDeviceRow).join("") || `<tr><td colspan="9"><div class="empty-state">${emptyText}${canOperate() ? `<br><button class="button primary" data-action="new-device">Cadastrar dispositivo</button>` : ""}</div></td></tr>`}
             </tbody>
           </table>
         </div>
@@ -1023,9 +1117,10 @@
     const maintenance = isMaintenanceActive(device);
     const status = device.is_active ? (maintenance ? "maintenance" : device.current_status) : "inactive";
     const lastCheck = device.last_check_at ? timeAgo(device.last_check_at) : "Nunca verificado";
-    const endpoint = [methodLabel(device.check_method), device.port ? `porta ${device.port}` : "", device.url_path && device.url_path !== "/" ? device.url_path : ""]
+    const endpoint = [methodLabel(device.check_method), device.port ? `porta ${device.port}` : ""]
       .filter(Boolean)
       .join(" - ");
+    const linkedSwitch = switchLabel(device.switch_id);
     return `
       <tr>
         <td>
@@ -1039,6 +1134,7 @@
         <td>${escapeHtml(device.host)}<div class="mini-text">${escapeHtml(endpoint)}</div></td>
         <td>${escapeHtml(device.type)}</td>
         <td>${escapeHtml(device.location)}</td>
+        <td>${linkedSwitch ? escapeHtml(linkedSwitch) : `<span class="mini-text">Sem vinculo</span>`}</td>
         <td><span class="badge ${criticalityClass(device.criticality)}">${labelCriticality(device.criticality)}</span></td>
         <td>${lastCheck}</td>
         <td><span class="badge ${status}">${status === "inactive" ? "INATIVO" : status === "maintenance" ? "MANUTENCAO" : device.current_status.toUpperCase()}</span></td>
@@ -1176,8 +1272,87 @@
     `;
   }
 
+  function renderMajorIncidentBanner() {
+    const incidents = openMajorIncidents();
+    if (!incidents.length) return "";
+    const incident = incidents[0];
+    return `
+      <section class="panel major-banner">
+        <div>
+          <div class="empty-kicker">Incidente maior</div>
+          <h2>${escapeHtml(incident.title)}</h2>
+          <p>${escapeHtml(incident.hypothesis || "Analise o incidente e registre a causa real.")}</p>
+          <div class="report-strip inline-strip">
+            <span><strong>${incident.affected_count || 0}</strong> afetado(s)</span>
+            <span><strong>${incidentStatusLabel(incident.status)}</strong> status</span>
+            <span><strong>${timeAgo(incident.detected_at)}</strong> detectado</span>
+          </div>
+        </div>
+        <div class="empty-actions">
+          <button class="button primary" data-view="incidents">Abrir incidentes</button>
+          <button class="button" data-action="edit-major-incident" data-id="${incident.id}">Analisar</button>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderMajorIncidentsPage() {
+    const incidents = asArray(state.majorIncidents);
+    const pending = openMajorIncidents().length;
+    return `
+      <div class="metric-grid">
+        <article class="metric-card"><div class="metric-icon red">IC</div><div><div class="metric-label">Pendentes</div><div class="metric-value">${pending}</div><div class="metric-help">Aguardam analise ou resolucao</div></div></article>
+        <article class="metric-card"><div class="metric-icon amber">AF</div><div><div class="metric-label">Afetados</div><div class="metric-value">${incidents.reduce((sum, item) => sum + Number(item.affected_count || 0), 0)}</div><div class="metric-help">Soma dos incidentes listados</div></div></article>
+        <article class="metric-card"><div class="metric-icon">DOC</div><div><div class="metric-label">Documentos</div><div class="metric-value">${incidents.length}</div><div class="metric-help">Registros para gestao</div></div></article>
+        <article class="metric-card"><div class="metric-icon green">UP</div><div><div class="metric-label">Host Sword</div><div class="metric-value">${incidents.some((item) => item.incident_type === "sword_host_down" && item.status !== "resolved") ? "!" : "OK"}</div><div class="metric-help">Janela sem monitoramento</div></div></article>
+      </div>
+      <section class="table-panel">
+        <div class="section-header" style="padding: 18px 18px 0;">
+          <h2 class="section-title">Incidentes maiores</h2>
+          <div class="filters">
+            <button class="button" data-action="run-monitor">Verificar agora</button>
+            <button class="button primary" data-action="download-major-incidents">Baixar Excel</button>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr><th>Incidente</th><th>Tipo</th><th>Status</th><th>Detectado</th><th>Resolvido</th><th>Afetados</th><th>Switch</th><th>Hipotese / causa</th><th>Acoes</th></tr>
+            </thead>
+            <tbody>
+              ${incidents.map(renderMajorIncidentRow).join("") || `<tr><td colspan="9"><div class="empty-state">Nenhum incidente maior registrado.</div></td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderMajorIncidentRow(incident) {
+    const statusClass = incident.status === "resolved" ? "online" : incident.status === "review" ? "medium" : "offline";
+    const cause = incident.root_cause || incident.hypothesis || "-";
+    return `
+      <tr>
+        <td><strong>${escapeHtml(incident.title)}</strong><div class="mini-text">${escapeHtml(incident.id)}</div></td>
+        <td><span class="badge inactive">${escapeHtml(incident.type_label || incidentTypeLabel(incident.incident_type))}</span></td>
+        <td><span class="badge ${statusClass}">${incidentStatusLabel(incident.status)}</span></td>
+        <td>${formatDate(incident.detected_at)}</td>
+        <td>${formatDate(incident.resolved_at)}</td>
+        <td><strong>${Number(incident.affected_count || 0)}</strong></td>
+        <td>${incident.switch_name ? escapeHtml(incident.switch_name) : `<span class="mini-text">-</span>`}</td>
+        <td>${escapeHtml(cause).slice(0, 180)}${cause.length > 180 ? "..." : ""}</td>
+        <td>
+          <div class="row-actions">
+            <button class="button compact" data-action="edit-major-incident" data-id="${incident.id}">Analisar</button>
+            <button class="button compact" data-action="download-major-incident" data-id="${incident.id}">Excel</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }
+
   function renderHistoryPage() {
-    let rows = historyRows().length ? historyRows() : filteredEvents().map((event) => ({
+    let rows = state.historyReport ? historyRows() : filteredEvents().map((event) => ({
       device_name: event.device?.name || event.device_id,
       host: event.device?.host || "",
       event_type: event.status === "open" ? "down_aberto" : "down_up_resolvido",
@@ -1518,10 +1693,15 @@
           <div class="field"><label>Intervalo de checagem (s)</label><input class="input" name="check_interval_seconds" type="number" min="1" value="${settings.check_interval_seconds}"></div>
           <div class="field"><label>Tentativas por dispositivo</label><input class="input" name="check_attempts" type="number" min="1" value="${settings.check_attempts}"></div>
           <div class="field"><label>Timeout de ping (ms)</label><input class="input" name="check_timeout_ms" type="number" min="50" value="${settings.check_timeout_ms}"></div>
+          <div class="field"><label>Lote automatico</label><input class="input" name="monitor_batch_size" type="number" min="1" value="${settings.monitor_batch_size}"></div>
           <div class="field"><label>Retencao de auditoria (dias)</label><input class="input" name="audit_retention_days" type="number" min="1" value="${settings.audit_retention_days}"></div>
           <div class="field"><label>Retencao de eventos (dias)</label><input class="input" name="event_retention_days" type="number" min="1" value="${settings.event_retention_days}"></div>
           <div class="field"><label>Retencao de backup (dias)</label><input class="input" name="backup_retention_days" type="number" min="1" value="${settings.backup_retention_days}"></div>
           <div class="field"><label>Bipe critico apos (min)</label><input class="input" name="critical_sound_minutes" type="number" min="1" value="${settings.critical_sound_minutes}"></div>
+          <div class="field"><label>Queda massiva a partir de</label><input class="input" name="major_incident_threshold_count" type="number" min="2" value="${settings.major_incident_threshold_count}"></div>
+          <div class="field"><label>Janela de queda massiva (min)</label><input class="input" name="major_incident_window_minutes" type="number" min="1" value="${settings.major_incident_window_minutes}"></div>
+          <div class="field"><label>Switch offline apos (min)</label><input class="input" name="switch_incident_minutes" type="number" min="1" value="${settings.switch_incident_minutes}"></div>
+          <div class="field"><label>Host Sword parado apos (min)</label><input class="input" name="monitor_gap_alert_minutes" type="number" min="1" value="${settings.monitor_gap_alert_minutes}"></div>
           <div class="field"><label>Tema padrao</label><select class="select" name="ui_theme">
             <option value="system"${settings.ui_theme === "system" ? " selected" : ""}>Sistema</option>
             <option value="light"${settings.ui_theme === "light" ? " selected" : ""}>Claro</option>
@@ -1534,6 +1714,8 @@
             <label class="checkbox-field"><input type="checkbox" name="require_csrf" ${settings.require_csrf ? "checked" : ""}> Exigir token anti-CSRF nas acoes de escrita</label>
             <label class="checkbox-field"><input type="checkbox" name="allow_viewer_export" ${settings.allow_viewer_export ? "checked" : ""}> Permitir exportacao para visualizadores</label>
             <label class="checkbox-field"><input type="checkbox" name="critical_sound_enabled" ${settings.critical_sound_enabled ? "checked" : ""}> Ativar bipe para criticidade alta prolongada</label>
+            <label class="checkbox-field"><input type="checkbox" name="major_incident_enabled" ${settings.major_incident_enabled ? "checked" : ""}> Detectar incidentes maiores automaticamente</label>
+            <label class="checkbox-field"><input type="checkbox" name="switch_incident_enabled" ${settings.switch_incident_enabled ? "checked" : ""}> Detectar acidente por switch vinculado offline</label>
           </div>
           <div class="field full"><button class="button primary" type="submit">Salvar configuracoes</button></div>
         </form>
@@ -1552,6 +1734,7 @@
       port: "",
       url_path: "/",
       expected_status: 200,
+      switch_id: "",
       owner: "",
       tags: "",
       notes: "",
@@ -1562,6 +1745,7 @@
       is_active: true
     };
     const isEdit = Boolean(device.id);
+    const switches = switchDevices(device.id);
 
     return `
       <div class="modal-backdrop">
@@ -1612,11 +1796,15 @@
               <div class="field-help">Obrigatoria para TCP. Opcional para HTTP/HTTPS.</div>
             </div>
             <div class="field">
-              <label for="url_path">Caminho HTTP</label>
-              <input class="input" id="url_path" name="url_path" value="${escapeHtml(device.url_path || "/")}" placeholder="/">
+              <label for="switch_id">Switch vinculado</label>
+              <select class="select" id="switch_id" name="switch_id">
+                <option value="">Nenhum switch vinculado</option>
+                ${switches.map((item) => `<option value="${item.id}"${device.switch_id === item.id ? " selected" : ""}>${escapeHtml(item.name)}${item.host ? ` - ${escapeHtml(item.host)}` : ""}</option>`).join("")}
+              </select>
+              <div class="field-help">Use para mapear a topologia. Se o switch cair por 2 minutos, o Sword abre um incidente proprio com os equipamentos vinculados.</div>
             </div>
             <div class="field">
-              <label for="expected_status">Status esperado</label>
+              <label for="expected_status">Status HTTP esperado</label>
               <input class="input" id="expected_status" name="expected_status" type="number" min="100" max="599" value="${escapeHtml(device.expected_status ?? 200)}" placeholder="200">
             </div>
             <div class="field">
@@ -1811,6 +1999,102 @@
     `;
   }
 
+  function renderIncidentModal() {
+    const incident = state.incidentModal.incident;
+    const devices = asArray(incident.affected_devices);
+    return `
+      <div class="modal-backdrop">
+        <form class="modal wide-modal" id="incident-form">
+          <div class="modal-header">
+            <div>
+              <h2 class="section-title">Analise do incidente</h2>
+              <div class="mini-text">${escapeHtml(incident.id)} - ${formatDate(incident.detected_at)}</div>
+            </div>
+            <button class="button icon-only" type="button" data-action="close-incident-modal">X</button>
+          </div>
+          <div class="form-grid">
+            <div class="field full">
+              <label>Titulo</label>
+              <input class="input" name="title" value="${escapeHtml(incident.title)}">
+            </div>
+            <div class="field">
+              <label>Tipo</label>
+              <select class="select" name="incident_type">
+                ${[
+                  ["mass_outage", "Queda massiva"],
+                  ["switch_outage", "Switch offline"],
+                  ["power_outage", "Queda de energia"],
+                  ["network_outage", "Falha de rede"],
+                  ["internet_outage", "Falha de link"],
+                  ["sword_host_down", "Host Sword sem monitoramento"],
+                  ["maintenance", "Manutencao"],
+                  ["other", "Outro"]
+                ].map(([value, label]) => `<option value="${value}"${incident.incident_type === value ? " selected" : ""}>${label}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field">
+              <label>Status</label>
+              <select class="select" name="status">
+                <option value="open"${incident.status === "open" ? " selected" : ""}>Aberto</option>
+                <option value="review"${incident.status === "review" ? " selected" : ""}>Em analise</option>
+                <option value="resolved"${incident.status === "resolved" ? " selected" : ""}>Resolvido</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Severidade</label>
+              <select class="select" name="severity">
+                <option value="high"${incident.severity === "high" ? " selected" : ""}>Alta</option>
+                <option value="critical"${incident.severity === "critical" ? " selected" : ""}>Critica</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Switch relacionado</label>
+              <input class="input" value="${escapeHtml(incident.switch_name || "Nao vinculado")}" disabled>
+            </div>
+            <div class="field">
+              <label>Ativos afetados</label>
+              <input class="input" value="${Number(incident.affected_count || 0)}" disabled>
+            </div>
+            <div class="field full">
+              <label>Hipotese automatica do Sword</label>
+              <textarea class="textarea" name="hypothesis">${escapeHtml(incident.hypothesis || "")}</textarea>
+            </div>
+            <div class="field full">
+              <label>Causa real / motivo informado</label>
+              <textarea class="textarea" name="root_cause" placeholder="Ex.: queda de energia no Data Center 01, falha no nobreak, manutencao da concessionaria...">${escapeHtml(incident.root_cause || "")}</textarea>
+            </div>
+            <div class="field full">
+              <label>Impacto para a empresa</label>
+              <textarea class="textarea" name="impact_summary" placeholder="Quais setores, servicos ou usuarios foram afetados?">${escapeHtml(incident.impact_summary || "")}</textarea>
+            </div>
+            <div class="field full">
+              <label>Acao tomada</label>
+              <textarea class="textarea" name="action_taken" placeholder="O que foi feito para normalizar ou prevenir recorrencia?">${escapeHtml(incident.action_taken || "")}</textarea>
+            </div>
+            <div class="field full">
+              <label>Observacoes</label>
+              <textarea class="textarea" name="notes">${escapeHtml(incident.notes || "")}</textarea>
+            </div>
+            <div class="field full">
+              <label>Dispositivos afetados</label>
+              <div class="incident-device-list">
+                ${devices.slice(0, 40).map((device) => `
+                  <span>${escapeHtml(device.name)} <small>${escapeHtml(device.host || "")}</small></span>
+                `).join("") || `<span>Nenhum dispositivo vinculado.</span>`}
+                ${devices.length > 40 ? `<span>+${devices.length - 40} outros</span>` : ""}
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="button" type="button" data-action="download-major-incident" data-id="${incident.id}">Baixar Excel</button>
+            <button class="button" type="button" data-action="close-incident-modal">Cancelar</button>
+            <button class="button primary" type="submit">Salvar analise</button>
+          </div>
+        </form>
+      </div>
+    `;
+  }
+
   function bindEvents() {
     app.querySelectorAll("[data-view]").forEach((button) => {
       button.addEventListener("click", async () => {
@@ -1930,6 +2214,11 @@
     if (integrationForm) {
       integrationForm.addEventListener("submit", handleIntegrationSubmit);
     }
+
+    const incidentForm = app.querySelector("#incident-form");
+    if (incidentForm) {
+      incidentForm.addEventListener("submit", handleIncidentSubmit);
+    }
   }
 
   async function handleAction(event) {
@@ -1968,6 +2257,7 @@
         state.devices = [];
         state.events = [];
         state.alerts = [];
+        state.majorIncidents = [];
         state.users = [];
         render();
         return;
@@ -2009,12 +2299,29 @@
         setToast("Auditoria preparada para Excel.");
       }
 
+      if (action === "download-major-incidents") {
+        downloadUrl("/api/major-incidents/export");
+        await loadData({ silent: true });
+        setToast("Incidentes maiores preparados para Excel.");
+      }
+
+      if (action === "download-major-incident") {
+        downloadUrl(`/api/major-incidents/${id}/export`);
+        setToast("Documento do incidente preparado.");
+      }
+
       if (action === "clear-history") {
-        if (window.confirm("Limpar historico resolvido? Incidentes abertos serao preservados.")) {
-          await api.delete("/api/events?scope=resolved");
+        if (window.confirm("Limpar todo o historico e alertas? Se algum ativo ainda estiver offline, um novo evento sera criado no proximo ciclo.")) {
+          await api.delete("/api/events?scope=all");
+          state.events = [];
+          state.alerts = [];
+          state.historyReport = {
+            rows: [],
+            summary: { events: 0, open_events: 0, total_duration_seconds: 0 }
+          };
           await loadData({ silent: true });
           await loadHistoryReport();
-          setToast("Historico resolvido limpo.");
+          setToast("Historico e alertas limpos.");
           render();
         }
       }
@@ -2022,7 +2329,18 @@
       if (action === "clear-reports") {
         if (window.confirm("Limpar a lista de relatorios gerados?")) {
           await api.delete("/api/report-snapshots");
-          await loadReport();
+          state.reportSnapshots = [];
+          state.report = {
+            rows: [],
+            summary: {
+              availability_percent: 0,
+              total_up_seconds: 0,
+              total_down_seconds: 0,
+              open_incidents: 0,
+              attention: 0,
+              events: 0
+            }
+          };
           setToast("Relatorios gerados limpos.");
           render();
         }
@@ -2147,6 +2465,19 @@
         await loadData({ silent: true });
         setToast("Alerta marcado como resolvido.");
       }
+
+      if (action === "edit-major-incident") {
+        const incident = majorIncidentById(id);
+        if (incident) {
+          state.incidentModal = { incident: { ...incident } };
+          render();
+        }
+      }
+
+      if (action === "close-incident-modal") {
+        state.incidentModal = null;
+        render();
+      }
     } catch (error) {
       setToast(error.message);
     }
@@ -2208,8 +2539,9 @@
       criticality: form.get("criticality"),
       check_method: form.get("check_method"),
       port: form.get("port"),
-      url_path: form.get("url_path"),
+      url_path: "/",
       expected_status: form.get("expected_status"),
+      switch_id: form.get("switch_id"),
       owner: form.get("owner"),
       tags: form.get("tags"),
       notes: form.get("notes"),
@@ -2305,6 +2637,35 @@
     }
   }
 
+  async function handleIncidentSubmit(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const incident = state.incidentModal?.incident;
+    if (!incident) return;
+
+    const payload = {
+      title: form.get("title"),
+      incident_type: form.get("incident_type"),
+      status: form.get("status"),
+      severity: form.get("severity"),
+      hypothesis: form.get("hypothesis"),
+      root_cause: form.get("root_cause"),
+      impact_summary: form.get("impact_summary"),
+      action_taken: form.get("action_taken"),
+      notes: form.get("notes")
+    };
+
+    try {
+      await api.put(`/api/major-incidents/${incident.id}`, payload);
+      state.incidentModal = null;
+      await loadData({ silent: true });
+      setToast("Analise do incidente salva.");
+      render();
+    } catch (error) {
+      setToast(error.message);
+    }
+  }
+
   async function handleSettingsSubmit(event) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -2316,10 +2677,17 @@
       check_interval_seconds: Number(form.get("check_interval_seconds")),
       check_attempts: Number(form.get("check_attempts")),
       check_timeout_ms: Number(form.get("check_timeout_ms")),
+      monitor_batch_size: Number(form.get("monitor_batch_size")),
       audit_retention_days: Number(form.get("audit_retention_days")),
       event_retention_days: Number(form.get("event_retention_days")),
       backup_retention_days: Number(form.get("backup_retention_days")),
       critical_sound_minutes: Number(form.get("critical_sound_minutes")),
+      major_incident_enabled: form.get("major_incident_enabled") === "on",
+      major_incident_threshold_count: Number(form.get("major_incident_threshold_count")),
+      major_incident_window_minutes: Number(form.get("major_incident_window_minutes")),
+      switch_incident_enabled: form.get("switch_incident_enabled") === "on",
+      switch_incident_minutes: Number(form.get("switch_incident_minutes")),
+      monitor_gap_alert_minutes: Number(form.get("monitor_gap_alert_minutes")),
       ui_theme: form.get("ui_theme"),
       require_csrf: form.get("require_csrf") === "on",
       allow_viewer_export: form.get("allow_viewer_export") === "on",
@@ -2357,7 +2725,7 @@
 
   loadAuthStatus();
   window.setInterval(() => {
-    if (state.auth.user && !state.modal && !state.userModal && !state.passwordModal && !state.integrationModal) {
+    if (state.auth.user && !isEditingSurfaceActive()) {
       loadData({ silent: true });
     }
   }, 5000);

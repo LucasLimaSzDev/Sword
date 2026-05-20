@@ -1,4 +1,4 @@
-# Sword 5.0
+# Sword 7.0
 
 <p align="center">
   <img src="./public/sword-logo.svg" alt="Sword logo" width="96">
@@ -16,7 +16,7 @@
 
 ## Visao geral
 
-Versao focada em relatorios, exportacoes, temas e refinamento operacional.
+Versao com topologia, vinculo de switch e incidentes maiores mais precisos.
 
 Sword foi criado e desenvolvido por Lucas Lima (LucasLimaSzDev) como uma
 solucao local para acompanhar disponibilidade, ativos, alertas e incidentes de
@@ -24,11 +24,11 @@ infraestrutura.
 
 ## Destaques da versao
 
-- Relatorios por periodo e dispositivo.
-- Exportacoes CSV compativeis com Excel.
-- Historico e auditoria filtraveis e exportaveis.
-- Temas visuais, foto de usuario e bipe critico.
-- Campos adicionais para patrimonio, serial e modelo.
+- Cadastro de ativo com switch vinculado.
+- Priorizacao de switches no ciclo automatico de monitoramento.
+- Incidente de switch offline com dispositivos impactados.
+- Exportacoes Excel em formato XLS com HTML estilizado.
+- Menos piscadas na interface durante atualizacoes automaticas.
 
 ## Como executar
 

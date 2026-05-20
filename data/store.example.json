@@ -20,7 +20,7 @@
     "settings":  {
                      "app_name":  "Sword",
                      "security_mode":  "hardened-local",
-                     "session_hours":  8,
+                     "session_hours":  12,
                      "login_rate_limit_window_minutes":  15,
                      "login_rate_limit_max_attempts":  5,
                      "audit_retention_days":  180,
@@ -34,7 +34,14 @@
                      "updated_at":  null,
                      "critical_sound_enabled":  true,
                      "critical_sound_minutes":  5,
-                     "ui_theme":  "system"
+                     "ui_theme":  "system",
+                     "monitor_batch_size":  10,
+                     "major_incident_enabled":  true,
+                     "major_incident_threshold_count":  8,
+                     "major_incident_window_minutes":  5,
+                     "switch_incident_enabled":  true,
+                     "switch_incident_minutes":  2,
+                     "monitor_gap_alert_minutes":  5
                  },
     "integrations":  [
 
@@ -44,5 +51,16 @@
                                ],
     "report_snapshots":  [
 
-                         ]
+                         ],
+    "major_incidents":  [
+
+                        ],
+    "monitor_state":  {
+                          "started_at":  null,
+                          "last_heartbeat_at":  null,
+                          "last_cycle_at":  null,
+                          "last_cycle_device_count":  0,
+                          "next_device_index":  0,
+                          "updated_at":  null
+                      }
 }

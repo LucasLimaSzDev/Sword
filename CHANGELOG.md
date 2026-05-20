@@ -2,6 +2,16 @@
 
 Todas as versoes publicas do Sword listadas aqui foram criadas por Lucas Lima (LucasLimaSzDev).
 
+## v7.0 - 7.0
+
+Versao com topologia, vinculo de switch e incidentes maiores mais precisos.
+
+- Cadastro de ativo com switch vinculado.
+- Priorizacao de switches no ciclo automatico de monitoramento.
+- Incidente de switch offline com dispositivos impactados.
+- Exportacoes Excel em formato XLS com HTML estilizado.
+- Menos piscadas na interface durante atualizacoes automaticas.
+
 ## v5.0 - 5.0
 
 Versao focada em relatorios, exportacoes, temas e refinamento operacional.

@@ -17,7 +17,7 @@ function Get-DefaultSettings {
   return [pscustomobject][ordered]@{
     app_name = "Sword"
     security_mode = "hardened-local"
-    session_hours = 8
+    session_hours = 12
     login_rate_limit_window_minutes = 15
     login_rate_limit_max_attempts = 5
     audit_retention_days = 180
@@ -26,10 +26,17 @@ function Get-DefaultSettings {
     check_interval_seconds = $CheckIntervalSeconds
     check_attempts = $Attempts
     check_timeout_ms = $TimeoutMs
+    monitor_batch_size = 10
     require_csrf = $true
     allow_viewer_export = $false
     critical_sound_enabled = $true
     critical_sound_minutes = 5
+    major_incident_enabled = $true
+    major_incident_threshold_count = 8
+    major_incident_window_minutes = 5
+    switch_incident_enabled = $true
+    switch_incident_minutes = 2
+    monitor_gap_alert_minutes = 5
     ui_theme = "system"
     updated_at = Get-NowIso
   }
@@ -88,6 +95,20 @@ function Read-Store {
   $store | Add-Member -NotePropertyName integrations -NotePropertyValue @(Get-CleanArray $store.integrations) -Force
   $store | Add-Member -NotePropertyName integration_deliveries -NotePropertyValue @(Get-CleanArray $store.integration_deliveries) -Force
   $store | Add-Member -NotePropertyName report_snapshots -NotePropertyValue @(Get-CleanArray $store.report_snapshots) -Force
+  $store | Add-Member -NotePropertyName major_incidents -NotePropertyValue @(Get-CleanArray $store.major_incidents) -Force
+  if ($null -eq $store.monitor_state) {
+    $store | Add-Member -NotePropertyName monitor_state -NotePropertyValue ([pscustomobject][ordered]@{
+      started_at = $null
+      last_heartbeat_at = $null
+      last_cycle_at = $null
+      last_cycle_device_count = 0
+      next_device_index = 0
+      updated_at = $null
+    }) -Force
+  }
+  if ($null -eq $store.monitor_state.next_device_index) {
+    $store.monitor_state | Add-Member -NotePropertyName next_device_index -NotePropertyValue 0 -Force
+  }
   if ($null -eq $store.settings) {
     $store | Add-Member -NotePropertyName settings -NotePropertyValue (Get-DefaultSettings) -Force
   }
@@ -102,6 +123,7 @@ function Read-Store {
     if ($null -eq $device.port) { $device | Add-Member -NotePropertyName port -NotePropertyValue $null -Force }
     if ($null -eq $device.url_path) { $device | Add-Member -NotePropertyName url_path -NotePropertyValue "/" -Force }
     if ($null -eq $device.expected_status) { $device | Add-Member -NotePropertyName expected_status -NotePropertyValue 200 -Force }
+    if ($null -eq $device.switch_id) { $device | Add-Member -NotePropertyName switch_id -NotePropertyValue "" -Force }
     if ($null -eq $device.owner) { $device | Add-Member -NotePropertyName owner -NotePropertyValue "" -Force }
     if ($null -eq $device.tags) { $device | Add-Member -NotePropertyName tags -NotePropertyValue "" -Force }
     if ($null -eq $device.notes) { $device | Add-Member -NotePropertyName notes -NotePropertyValue "" -Force }
@@ -126,6 +148,20 @@ function Save-Store($Store) {
   $Store | Add-Member -NotePropertyName integrations -NotePropertyValue @(Get-CleanArray $Store.integrations) -Force
   $Store | Add-Member -NotePropertyName integration_deliveries -NotePropertyValue @(Get-CleanArray $Store.integration_deliveries) -Force
   $Store | Add-Member -NotePropertyName report_snapshots -NotePropertyValue @(Get-CleanArray $Store.report_snapshots) -Force
+  $Store | Add-Member -NotePropertyName major_incidents -NotePropertyValue @(Get-CleanArray $Store.major_incidents) -Force
+  if ($null -eq $Store.monitor_state) {
+    $Store | Add-Member -NotePropertyName monitor_state -NotePropertyValue ([pscustomobject][ordered]@{
+      started_at = $null
+      last_heartbeat_at = $null
+      last_cycle_at = $null
+      last_cycle_device_count = 0
+      next_device_index = 0
+      updated_at = $null
+    }) -Force
+  }
+  if ($null -eq $Store.monitor_state.next_device_index) {
+    $Store.monitor_state | Add-Member -NotePropertyName next_device_index -NotePropertyValue 0 -Force
+  }
   if ($null -eq $Store.settings) {
     $Store | Add-Member -NotePropertyName settings -NotePropertyValue (Get-DefaultSettings) -Force
   }
@@ -363,6 +399,35 @@ function Get-DeviceById($Store, [string]$DeviceId) {
   return @(Get-CleanArray $Store.devices) | Where-Object { $_.id -eq $DeviceId } | Select-Object -First 1
 }
 
+function Test-IsSwitchDevice($Device) {
+  if ($null -eq $Device) {
+    return $false
+  }
+  return "$($Device.type)" -match "(?i)\bswitch\b"
+}
+
+function Get-SwitchDevices($Store) {
+  return @(Get-CleanArray $Store.devices | Where-Object { Test-IsSwitchDevice $_ })
+}
+
+function Get-SwitchName($Store, [string]$SwitchId) {
+  if ([string]::IsNullOrWhiteSpace($SwitchId)) {
+    return ""
+  }
+  $switch = Get-DeviceById $Store $SwitchId
+  if ($null -eq $switch) {
+    return ""
+  }
+  return $switch.name
+}
+
+function Get-DevicesBySwitch($Store, [string]$SwitchId) {
+  if ([string]::IsNullOrWhiteSpace($SwitchId)) {
+    return @()
+  }
+  return @(Get-CleanArray $Store.devices | Where-Object { "$($_.switch_id)" -eq $SwitchId })
+}
+
 function Test-AllowedValue([string]$Value, [string[]]$Allowed) {
   return $Allowed -contains "$Value".ToLowerInvariant()
 }
@@ -482,10 +547,17 @@ function Get-PublicSettings($Settings) {
     check_interval_seconds = [int]$Settings.check_interval_seconds
     check_attempts = [int]$Settings.check_attempts
     check_timeout_ms = [int]$Settings.check_timeout_ms
+    monitor_batch_size = [int]$Settings.monitor_batch_size
     require_csrf = [bool]$Settings.require_csrf
     allow_viewer_export = [bool]$Settings.allow_viewer_export
     critical_sound_enabled = [bool]$Settings.critical_sound_enabled
     critical_sound_minutes = [int]$Settings.critical_sound_minutes
+    major_incident_enabled = [bool]$Settings.major_incident_enabled
+    major_incident_threshold_count = [int]$Settings.major_incident_threshold_count
+    major_incident_window_minutes = [int]$Settings.major_incident_window_minutes
+    switch_incident_enabled = [bool]$Settings.switch_incident_enabled
+    switch_incident_minutes = [int]$Settings.switch_incident_minutes
+    monitor_gap_alert_minutes = [int]$Settings.monitor_gap_alert_minutes
     ui_theme = if ([string]::IsNullOrWhiteSpace($Settings.ui_theme)) { "system" } else { $Settings.ui_theme }
     updated_at = $Settings.updated_at
   }
@@ -736,7 +808,7 @@ function Get-SettingsBodyError($Body) {
     return "Corpo da requisicao invalido."
   }
 
-  foreach ($field in @("session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms", "critical_sound_minutes")) {
+  foreach ($field in @("session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms", "monitor_batch_size", "critical_sound_minutes", "major_incident_threshold_count", "major_incident_window_minutes", "switch_incident_minutes", "monitor_gap_alert_minutes")) {
     if ($null -ne $Body.$field) {
       $value = [int]$Body.$field
       if ($value -lt 1 -or $value -gt 100000) {
@@ -840,6 +912,78 @@ function ConvertTo-CsvText($Rows) {
   return (@($items | ConvertTo-Csv -NoTypeInformation) -join "`r`n")
 }
 
+function ConvertTo-HtmlText($Value) {
+  if ($null -eq $Value) {
+    return ""
+  }
+  return [System.Net.WebUtility]::HtmlEncode("$Value")
+}
+
+function ConvertTo-ExcelHtml($Title, $Subtitle, $Rows, $SummaryRows = @()) {
+  $items = @(Get-CleanArray $Rows)
+  $summary = @(Get-CleanArray $SummaryRows)
+  $columns = @()
+  if ($items.Count -gt 0) {
+    $columns = @($items[0].PSObject.Properties.Name)
+  }
+
+  $summaryHtml = ""
+  if ($summary.Count -gt 0) {
+    $summaryHtml += "<table class='summary'><tbody>"
+    foreach ($item in $summary) {
+      $summaryHtml += "<tr><th>$(ConvertTo-HtmlText $item.Indicador)</th><td>$(ConvertTo-HtmlText $item.Valor)</td></tr>"
+    }
+    $summaryHtml += "</tbody></table>"
+  }
+
+  $tableHtml = "<table class='data'><thead><tr>"
+  foreach ($column in $columns) {
+    $tableHtml += "<th>$(ConvertTo-HtmlText $column)</th>"
+  }
+  $tableHtml += "</tr></thead><tbody>"
+
+  if ($items.Count -eq 0) {
+    $tableHtml += "<tr><td class='empty'>Sem dados para os filtros selecionados.</td></tr>"
+  } else {
+    foreach ($item in $items) {
+      $tableHtml += "<tr>"
+      foreach ($column in $columns) {
+        $tableHtml += "<td>$(ConvertTo-HtmlText $item.$column)</td>"
+      }
+      $tableHtml += "</tr>"
+    }
+  }
+  $tableHtml += "</tbody></table>"
+
+  return @"
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: Segoe UI, Arial, sans-serif; color: #172033; }
+    h1 { margin: 0; padding: 14px 16px; background: #0f172a; color: #ffffff; font-size: 22px; }
+    .subtitle { padding: 8px 16px 14px; background: #eaf1ff; color: #334155; font-size: 12px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 14px; }
+    th { background: #1d4ed8; color: #ffffff; font-weight: 700; }
+    th, td { border: 1px solid #d7e0ec; padding: 8px 10px; font-size: 12px; vertical-align: top; }
+    tr:nth-child(even) td { background: #f8fafc; }
+    .summary { width: 520px; margin: 14px 0 4px 0; }
+    .summary th { background: #dbeafe; color: #172033; text-align: left; width: 220px; }
+    .summary td { font-weight: 700; }
+    .empty { text-align: center; color: #64748b; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>$(ConvertTo-HtmlText $Title)</h1>
+  <div class="subtitle">$(ConvertTo-HtmlText $Subtitle) - Gerado em $(Get-Date -Format "dd/MM/yyyy HH:mm:ss")</div>
+  $summaryHtml
+  $tableHtml
+</body>
+</html>
+"@
+}
+
 function New-ReportSnapshot($Store, $User, [string]$Kind, $Filters, [int]$RowCount) {
   $snapshot = [pscustomobject][ordered]@{
     id = New-EntityId "rpt"
@@ -914,14 +1058,14 @@ function Get-DeviceBodyError($Body, [bool]$IsCreate) {
     }
   }
 
-  foreach ($field in @("type", "location", "owner", "tags", "serial_number", "asset_tag", "model")) {
+  foreach ($field in @("type", "location", "owner", "tags", "serial_number", "asset_tag", "model", "switch_id")) {
     if ($null -ne $Body.$field -and "$($Body.$field)".Length -gt 120) {
       return "Campo $field deve ter ate 120 caracteres."
     }
   }
 
   if ($null -ne $Body.url_path -and "$($Body.url_path)".Length -gt 160) {
-    return "Caminho HTTP deve ter ate 160 caracteres."
+    return "Configuracao HTTP legada deve ter ate 160 caracteres."
   }
 
   if ($null -ne $Body.maintenance_until -and -not [string]::IsNullOrWhiteSpace($Body.maintenance_until)) {
@@ -1030,6 +1174,343 @@ function Invoke-AlertIntegrations($Store, $Device, $Event, $Alert) {
   }
 }
 
+function Get-MajorIncidentTypeLabel([string]$Type) {
+  switch ("$Type".ToLowerInvariant()) {
+    "mass_outage" { "Queda massiva" }
+    "switch_outage" { "Switch offline" }
+    "power_outage" { "Queda de energia" }
+    "network_outage" { "Falha de rede" }
+    "internet_outage" { "Falha de link" }
+    "sword_host_down" { "Host Sword sem monitoramento" }
+    "maintenance" { "Manutencao" }
+    default { "Outro" }
+  }
+}
+
+function Get-MajorIncidentStatusLabel([string]$Status) {
+  switch ("$Status".ToLowerInvariant()) {
+    "open" { "Aberto" }
+    "review" { "Aguardando analise" }
+    "resolved" { "Resolvido" }
+    default { $Status }
+  }
+}
+
+function Get-MajorIncidentHypothesis($Devices) {
+  $deviceList = @(Get-CleanArray $Devices)
+  if ($deviceList.Count -eq 0) {
+    return "Sem dispositivos vinculados. Verifique logs do servidor, energia do host e agenda de manutencao."
+  }
+
+  $locations = @($deviceList | Group-Object location | Sort-Object Count -Descending)
+  $types = @($deviceList | Group-Object type | Sort-Object Count -Descending)
+  $networkTypes = @("Firewall", "Switch", "Roteador", "Link Internet", "Access Point", "Controladora Wi-Fi", "Gateway", "Proxy")
+  $networkAffected = @($deviceList | Where-Object { $networkTypes -contains "$($_.type)" }).Count
+  $topLocation = if ($locations.Count -gt 0) { $locations[0].Name } else { "" }
+  $topLocationCount = if ($locations.Count -gt 0) { [int]$locations[0].Count } else { 0 }
+  $topType = if ($types.Count -gt 0) { $types[0].Name } else { "" }
+
+  if ($topLocationCount -ge [math]::Ceiling($deviceList.Count * 0.7) -and -not [string]::IsNullOrWhiteSpace($topLocation)) {
+    return "Possivel falha localizada em ${topLocation}: energia, switch principal, rack ou link local."
+  }
+
+  if ($networkAffected -gt 0) {
+    return "Possivel falha de rede principal, energia em rack, firewall, switch, roteador ou link de internet."
+  }
+
+  if ($deviceList.Count -ge 20) {
+    return "Possivel queda de energia geral, falha no backbone da rede, interrupcao de link ou problema no caminho ate o host do Sword."
+  }
+
+  return "Queda agrupada detectada. Verifique energia, rede, localidade predominante e tipo mais afetado: $topType."
+}
+
+function New-MajorIncident($Store, [string]$Type, [string]$Title, [string]$DetectedAt, [string]$Severity, [string[]]$DeviceIds, [string[]]$EventIds, [string]$Hypothesis, [string]$Source = "auto", [string]$Status = "open", [string]$ResolvedAt = $null) {
+  $duration = $null
+  if (-not [string]::IsNullOrWhiteSpace($ResolvedAt)) {
+    $duration = [int][math]::Max(0, ([datetime]::Parse($ResolvedAt) - [datetime]::Parse($DetectedAt)).TotalSeconds)
+  }
+
+  $incident = [pscustomobject][ordered]@{
+    id = New-EntityId "maj"
+    title = $Title
+    incident_type = $Type
+    status = $Status
+    severity = $Severity
+    detected_at = $DetectedAt
+    resolved_at = $ResolvedAt
+    duration_seconds = $duration
+    affected_count = @($DeviceIds).Count
+    affected_device_ids = @($DeviceIds)
+    affected_event_ids = @($EventIds)
+    switch_id = ""
+    hypothesis = $Hypothesis
+    root_cause = ""
+    impact_summary = ""
+    action_taken = ""
+    notes = ""
+    source = $Source
+    created_at = Get-NowIso
+    updated_at = Get-NowIso
+  }
+
+  $Store.major_incidents = @(Get-CleanArray $Store.major_incidents) + $incident
+  return $incident
+}
+
+function Get-MajorIncidentRows($Store) {
+  return @(Get-CleanArray $Store.major_incidents) |
+    Sort-Object { [datetime]::Parse($_.detected_at) } -Descending |
+    ForEach-Object {
+      $incident = $_
+      $devices = @(Get-CleanArray $incident.affected_device_ids | ForEach-Object { Get-DeviceById $Store "$_" } | Where-Object { $null -ne $_ })
+      $events = @(Get-CleanArray $Store.status_events | Where-Object { @(Get-CleanArray $incident.affected_event_ids) -contains $_.id })
+      [pscustomobject][ordered]@{
+        id = $incident.id
+        title = $incident.title
+        incident_type = $incident.incident_type
+        type_label = Get-MajorIncidentTypeLabel $incident.incident_type
+        status = $incident.status
+        status_label = Get-MajorIncidentStatusLabel $incident.status
+        severity = $incident.severity
+        detected_at = $incident.detected_at
+        resolved_at = $incident.resolved_at
+        duration_seconds = $incident.duration_seconds
+        affected_count = [int]$incident.affected_count
+        affected_device_ids = @(Get-CleanArray $incident.affected_device_ids)
+        affected_event_ids = @(Get-CleanArray $incident.affected_event_ids)
+        switch_id = if ($null -eq $incident.switch_id) { "" } else { $incident.switch_id }
+        switch_name = Get-SwitchName $Store $incident.switch_id
+        affected_devices = $devices
+        affected_events = $events
+        hypothesis = $incident.hypothesis
+        root_cause = $incident.root_cause
+        impact_summary = $incident.impact_summary
+        action_taken = $incident.action_taken
+        notes = $incident.notes
+        source = $incident.source
+        created_at = $incident.created_at
+        updated_at = $incident.updated_at
+      }
+    }
+}
+
+function Get-MajorIncidentExportRows($Store, [string]$IncidentId = "") {
+  $incidents = @(Get-MajorIncidentRows $Store)
+  if (-not [string]::IsNullOrWhiteSpace($IncidentId)) {
+    $incidents = @($incidents | Where-Object { $_.id -eq $IncidentId })
+  }
+
+  $rows = @()
+  foreach ($incident in $incidents) {
+    $devices = @(Get-CleanArray $incident.affected_devices)
+    if ($devices.Count -eq 0) {
+      $rows += [pscustomobject][ordered]@{
+        Incidente = $incident.title
+        Tipo = $incident.type_label
+        Status = $incident.status_label
+        Severidade = $incident.severity
+        DetectadoEm = $incident.detected_at
+        ResolvidoEm = $incident.resolved_at
+        Duracao = if ($null -eq $incident.duration_seconds) { "" } else { "$($incident.duration_seconds)s" }
+        Afetados = $incident.affected_count
+        Switch = $incident.switch_name
+        Dispositivo = "-"
+        Host = "-"
+        Localizacao = "-"
+        Criticidade = "-"
+        HipoteseAutomatica = $incident.hypothesis
+        CausaReal = $incident.root_cause
+        Impacto = $incident.impact_summary
+        AcaoTomada = $incident.action_taken
+        Observacoes = $incident.notes
+      }
+    } else {
+      foreach ($device in $devices) {
+        $rows += [pscustomobject][ordered]@{
+          Incidente = $incident.title
+          Tipo = $incident.type_label
+          Status = $incident.status_label
+          Severidade = $incident.severity
+          DetectadoEm = $incident.detected_at
+          ResolvidoEm = $incident.resolved_at
+          Duracao = if ($null -eq $incident.duration_seconds) { "" } else { "$($incident.duration_seconds)s" }
+          Afetados = $incident.affected_count
+          Switch = if ([string]::IsNullOrWhiteSpace($incident.switch_name)) { Get-SwitchName $Store $device.switch_id } else { $incident.switch_name }
+          Dispositivo = $device.name
+          Host = $device.host
+          Localizacao = $device.location
+          Criticidade = $device.criticality
+          HipoteseAutomatica = $incident.hypothesis
+          CausaReal = $incident.root_cause
+          Impacto = $incident.impact_summary
+          AcaoTomada = $incident.action_taken
+          Observacoes = $incident.notes
+        }
+      }
+    }
+  }
+
+  return $rows
+}
+
+function Register-SwitchIncidentDetection($Store) {
+  $settings = Get-PublicSettings $Store.settings
+  if ($settings.switch_incident_enabled -ne $true) {
+    return
+  }
+
+  $thresholdMinutes = [math]::Max(1, [int]$settings.switch_incident_minutes)
+  $now = Get-Date
+  foreach ($switch in @(Get-SwitchDevices $Store | Where-Object { $_.is_active -eq $true })) {
+    $openSwitchEvent = Get-OpenEvent $Store $switch.id
+    if ($null -eq $openSwitchEvent -or [string]::IsNullOrWhiteSpace($openSwitchEvent.down_at)) {
+      continue
+    }
+
+    $downAt = $null
+    try { $downAt = [datetime]::Parse($openSwitchEvent.down_at) } catch { $downAt = $null }
+    if ($null -eq $downAt -or (($now - $downAt).TotalMinutes -lt $thresholdMinutes)) {
+      continue
+    }
+
+    $existing = @(Get-CleanArray $Store.major_incidents | Where-Object {
+      $_.incident_type -eq "switch_outage" -and
+      $_.status -ne "resolved" -and
+      (
+        "$($_.switch_id)" -eq "$($switch.id)" -or
+        @(Get-CleanArray $_.affected_device_ids) -contains $switch.id
+      )
+    }) | Select-Object -First 1
+
+    $linkedDevices = @(Get-DevicesBySwitch $Store $switch.id | Where-Object { $_.is_active -eq $true })
+    if ($linkedDevices.Count -eq 0) {
+      continue
+    }
+    $affectedIds = @(@($switch.id) + @($linkedDevices | ForEach-Object { $_.id }) | Select-Object -Unique)
+    $linkedEvents = @(Get-CleanArray $Store.status_events | Where-Object { $affectedIds -contains $_.device_id -and $_.status -eq "open" })
+    $eventIds = @(@($openSwitchEvent.id) + @($linkedEvents | ForEach-Object { $_.id }) | Select-Object -Unique)
+    $locationText = if ([string]::IsNullOrWhiteSpace($switch.location)) { "local nao informado" } else { $switch.location }
+    $hypothesis = "Switch '$($switch.name)' esta offline ha pelo menos $thresholdMinutes minuto(s) em $locationText. Possivel reinicializacao prolongada, queda de energia no rack, porta uplink inativa, fonte, loop, PoE, fibra/cabo ou manutencao nao registrada."
+    $severity = if ("$($switch.criticality)" -in @("alta", "critica")) { "critical" } else { "high" }
+
+    if ($null -eq $existing) {
+      $incident = New-MajorIncident $Store "switch_outage" ("Switch offline: {0} ({1} vinculados)" -f $switch.name, $linkedDevices.Count) $openSwitchEvent.down_at $severity $affectedIds $eventIds $hypothesis "auto" "open"
+      $incident.switch_id = $switch.id
+    } else {
+      $existing.switch_id = $switch.id
+      $existing.affected_device_ids = @($affectedIds)
+      $existing.affected_event_ids = @($eventIds)
+      $existing.affected_count = @($affectedIds).Count
+      $existing.hypothesis = $hypothesis
+      $existing.updated_at = Get-NowIso
+    }
+  }
+
+  foreach ($incident in @(Get-CleanArray $Store.major_incidents | Where-Object { $_.status -eq "open" -and $_.incident_type -eq "switch_outage" })) {
+    $switchId = if ([string]::IsNullOrWhiteSpace($incident.switch_id)) { (@(Get-CleanArray $incident.affected_device_ids) | Select-Object -First 1) } else { $incident.switch_id }
+    $switch = Get-DeviceById $Store "$switchId"
+    $openSwitchEvent = if ($null -eq $switch) { $null } else { Get-OpenEvent $Store $switch.id }
+    if ($null -ne $switch -and ($switch.current_status -eq "online" -or $null -eq $openSwitchEvent)) {
+      $resolvedAt = Get-NowIso
+      $incident.status = "review"
+      $incident.resolved_at = $resolvedAt
+      $incident.duration_seconds = [int][math]::Max(0, ([datetime]::Parse($resolvedAt) - [datetime]::Parse($incident.detected_at)).TotalSeconds)
+      $incident.updated_at = $resolvedAt
+    }
+  }
+}
+
+function Register-MajorIncidentDetection($Store) {
+  $settings = Get-PublicSettings $Store.settings
+  if ($settings.major_incident_enabled -ne $true) {
+    return
+  }
+
+  $threshold = [math]::Max(2, [int]$settings.major_incident_threshold_count)
+  $windowMinutes = [math]::Max(1, [int]$settings.major_incident_window_minutes)
+  $now = Get-Date
+  $windowStart = $now.AddMinutes(-$windowMinutes)
+  $recentOpenEvents = @(Get-CleanArray $Store.status_events | Where-Object {
+    $_.status -eq "open" -and
+    -not [string]::IsNullOrWhiteSpace($_.down_at) -and
+    [datetime]::Parse($_.down_at) -ge $windowStart
+  })
+
+  if ($recentOpenEvents.Count -ge $threshold) {
+    $eventIds = @($recentOpenEvents | ForEach-Object { $_.id } | Select-Object -Unique)
+    $deviceIds = @($recentOpenEvents | ForEach-Object { $_.device_id } | Select-Object -Unique)
+    $devices = @($deviceIds | ForEach-Object { Get-DeviceById $Store "$_" } | Where-Object { $null -ne $_ })
+    $hypothesis = Get-MajorIncidentHypothesis $devices
+    $detectedAt = (@($recentOpenEvents | Sort-Object { [datetime]::Parse($_.down_at) }) | Select-Object -First 1).down_at
+    $existing = @(Get-CleanArray $Store.major_incidents | Where-Object { $_.status -ne "resolved" -and $_.incident_type -eq "mass_outage" }) |
+      Sort-Object { [datetime]::Parse($_.detected_at) } -Descending |
+      Select-Object -First 1
+
+    if ($null -eq $existing) {
+      New-MajorIncident $Store "mass_outage" ("Incidente massivo detectado: {0} dispositivos offline" -f $deviceIds.Count) $detectedAt "critical" $deviceIds $eventIds $hypothesis "auto" "open" | Out-Null
+    } else {
+      $existing.affected_device_ids = @(@(Get-CleanArray $existing.affected_device_ids) + $deviceIds | Select-Object -Unique)
+      $existing.affected_event_ids = @(@(Get-CleanArray $existing.affected_event_ids) + $eventIds | Select-Object -Unique)
+      $existing.affected_count = @($existing.affected_device_ids).Count
+      $existing.hypothesis = $hypothesis
+      $existing.updated_at = Get-NowIso
+    }
+  }
+
+  foreach ($incident in @(Get-CleanArray $Store.major_incidents | Where-Object { $_.status -eq "open" -and $_.incident_type -eq "mass_outage" })) {
+    $eventIds = @(Get-CleanArray $incident.affected_event_ids)
+    if ($eventIds.Count -gt 0) {
+      $openLinked = @(Get-CleanArray $Store.status_events | Where-Object { $eventIds -contains $_.id -and $_.status -eq "open" })
+      if ($openLinked.Count -eq 0) {
+        $resolvedAt = Get-NowIso
+        $incident.status = "review"
+        $incident.resolved_at = $resolvedAt
+        $incident.duration_seconds = [int][math]::Max(0, ([datetime]::Parse($resolvedAt) - [datetime]::Parse($incident.detected_at)).TotalSeconds)
+        $incident.updated_at = $resolvedAt
+      }
+    }
+  }
+}
+
+function Register-SwordHostGap {
+  $store = Read-Store
+  $settings = Get-PublicSettings $store.settings
+  $now = Get-Date
+  $nowIso = $now.ToString("o")
+  $gapMinutes = [math]::Max(1, [int]$settings.monitor_gap_alert_minutes)
+  $lastHeartbeat = $null
+  if ($null -ne $store.monitor_state -and -not [string]::IsNullOrWhiteSpace($store.monitor_state.last_heartbeat_at)) {
+    try { $lastHeartbeat = [datetime]::Parse($store.monitor_state.last_heartbeat_at) } catch { $lastHeartbeat = $null }
+  }
+
+  if ($null -ne $lastHeartbeat) {
+    $durationSeconds = [int][math]::Max(0, ($now - $lastHeartbeat).TotalSeconds)
+    if ($durationSeconds -ge ($gapMinutes * 60)) {
+      $alreadyRegistered = @(Get-CleanArray $store.major_incidents | Where-Object {
+        $_.incident_type -eq "sword_host_down" -and $_.detected_at -eq $lastHeartbeat.ToString("o")
+      }).Count -gt 0
+      if (-not $alreadyRegistered) {
+        $incident = New-MajorIncident $store "sword_host_down" "Janela sem monitoramento detectada no host do Sword" $lastHeartbeat.ToString("o") "high" @() @() "O Sword ficou sem registrar heartbeat. Possivel desligamento do host, queda de energia, reinicializacao, travamento ou parada manual do processo." "system" "review" $nowIso
+        $incident.duration_seconds = $durationSeconds
+      }
+    }
+  }
+
+  $store.monitor_state.started_at = $nowIso
+  $store.monitor_state.last_heartbeat_at = $nowIso
+  $store.monitor_state.updated_at = $nowIso
+  Save-Store $store
+}
+
+function Update-MonitorHeartbeat($Store, [int]$CheckedCount) {
+  $now = Get-NowIso
+  $Store.monitor_state.last_heartbeat_at = $now
+  $Store.monitor_state.last_cycle_at = $now
+  $Store.monitor_state.last_cycle_device_count = $CheckedCount
+  $Store.monitor_state.updated_at = $now
+}
+
 function Resolve-EventAndAlerts($Store, $Device, [string]$Now) {
   $openEvent = Get-OpenEvent $Store $Device.id
   if ($null -eq $openEvent) {
@@ -1108,16 +1589,39 @@ function Invoke-DeviceCheck($Store, $Device) {
   }
 }
 
-function Invoke-MonitorCycle {
+function Invoke-MonitorCycle([int]$MaxDevices = 0) {
   $store = Read-Store
   $results = @()
+  $activeDevices = @(Get-CleanArray $store.devices | Where-Object { $_.is_active -eq $true })
+  $switchDevices = @(Get-SwitchDevices $store | Where-Object { $_.is_active -eq $true })
+  $regularDevices = @($activeDevices | Where-Object { -not (Test-IsSwitchDevice $_) })
+  $devicesToCheck = $activeDevices
 
-  foreach ($device in @(Get-CleanArray $store.devices)) {
-    if ($device.is_active -eq $true) {
-      $results += Invoke-DeviceCheck $store $device
+  if ($MaxDevices -gt 0 -and $regularDevices.Count -gt $MaxDevices) {
+    $startIndex = 0
+    try { $startIndex = [int]$store.monitor_state.next_device_index } catch { $startIndex = 0 }
+    if ($startIndex -lt 0 -or $startIndex -ge $regularDevices.Count) {
+      $startIndex = 0
     }
+
+    $devicesToCheck = @()
+    for ($i = 0; $i -lt $MaxDevices; $i++) {
+      $index = ($startIndex + $i) % $regularDevices.Count
+      $devicesToCheck += $regularDevices[$index]
+    }
+    $store.monitor_state.next_device_index = ($startIndex + $MaxDevices) % $regularDevices.Count
+    $devicesToCheck = @(@($switchDevices) + @($devicesToCheck) | Sort-Object id -Unique)
+  } elseif ($null -ne $store.monitor_state) {
+    $store.monitor_state.next_device_index = 0
   }
 
+  foreach ($device in $devicesToCheck) {
+    $results += Invoke-DeviceCheck $store $device
+  }
+
+  Register-SwitchIncidentDetection $store
+  Register-MajorIncidentDetection $store
+  Update-MonitorHeartbeat $store @($results).Count
   Save-Store $store
   return $results
 }
@@ -1128,6 +1632,7 @@ function Get-Summary($Store) {
   $offline = @($activeDevices | Where-Object { $_.current_status -eq "offline" })
   $criticalOffline = @($offline | Where-Object { "$($_.criticality)".ToLowerInvariant() -in @("alta", "critica") })
   $openAlerts = @(Get-CleanArray $Store.alerts | Where-Object { $_.status -eq "open" })
+  $openMajorIncidents = @(Get-CleanArray $Store.major_incidents | Where-Object { $_.status -ne "resolved" })
 
   return [pscustomobject]@{
     total = @($activeDevices).Count
@@ -1135,6 +1640,7 @@ function Get-Summary($Store) {
     offline = $offline.Count
     critical_offline = $criticalOffline.Count
     open_alerts = $openAlerts.Count
+    open_major_incidents = $openMajorIncidents.Count
     generated_at = Get-NowIso
   }
 }
@@ -1210,6 +1716,8 @@ function Get-AvailabilityReport($Store, $Request = $null) {
       host = $device.host
       type = $device.type
       location = $device.location
+      switch_id = if ($null -eq $device.switch_id) { "" } else { $device.switch_id }
+      switch_name = Get-SwitchName $Store $device.switch_id
       criticality = $device.criticality
       current_status = $device.current_status
       check_method = if ([string]::IsNullOrWhiteSpace($device.check_method)) { "ping" } else { $device.check_method }
@@ -1263,6 +1771,7 @@ function Get-AvailabilityExportRows($Report) {
       Host = $_.host
       Tipo = $_.type
       Localizacao = $_.location
+      Switch = $_.switch_name
       Serial = $_.serial_number
       Patrimonio = $_.asset_tag
       Modelo = $_.model
@@ -1452,6 +1961,7 @@ function New-DeviceFromBody($Body, [string]$Now) {
     port = if ($null -eq $Body.port -or "$($Body.port)" -eq "") { $null } else { [int]$Body.port }
     url_path = if ([string]::IsNullOrWhiteSpace($Body.url_path)) { "/" } else { "$($Body.url_path)".Trim() }
     expected_status = if ($null -eq $Body.expected_status -or "$($Body.expected_status)" -eq "") { 200 } else { [int]$Body.expected_status }
+    switch_id = if ([string]::IsNullOrWhiteSpace($Body.switch_id)) { "" } else { "$($Body.switch_id)".Trim() }
     owner = if ([string]::IsNullOrWhiteSpace($Body.owner)) { "" } else { "$($Body.owner)".Trim() }
     tags = if ([string]::IsNullOrWhiteSpace($Body.tags)) { "" } else { "$($Body.tags)".Trim() }
     notes = if ([string]::IsNullOrWhiteSpace($Body.notes)) { "" } else { "$($Body.notes)".Trim() }
@@ -1467,7 +1977,7 @@ function New-DeviceFromBody($Body, [string]$Now) {
 }
 
 function Update-DeviceFromBody($Device, $Body, [string]$Now) {
-  foreach ($field in @("name", "host", "type", "location", "criticality", "current_status", "check_method", "url_path", "owner", "tags", "notes", "serial_number", "asset_tag", "model", "maintenance_until")) {
+  foreach ($field in @("name", "host", "type", "location", "criticality", "current_status", "check_method", "url_path", "switch_id", "owner", "tags", "notes", "serial_number", "asset_tag", "model", "maintenance_until")) {
     if ($null -ne $Body.$field) {
       $value = "$($Body.$field)".Trim()
       if ($field -in @("criticality", "current_status", "check_method")) {
@@ -1666,7 +2176,7 @@ function Handle-ApiRequest($Context) {
         return
       }
 
-      foreach ($field in @("app_name", "session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms", "require_csrf", "allow_viewer_export", "critical_sound_enabled", "critical_sound_minutes", "ui_theme")) {
+      foreach ($field in @("app_name", "session_hours", "login_rate_limit_window_minutes", "login_rate_limit_max_attempts", "audit_retention_days", "event_retention_days", "backup_retention_days", "check_interval_seconds", "check_attempts", "check_timeout_ms", "monitor_batch_size", "require_csrf", "allow_viewer_export", "critical_sound_enabled", "critical_sound_minutes", "major_incident_enabled", "major_incident_threshold_count", "major_incident_window_minutes", "switch_incident_enabled", "switch_incident_minutes", "monitor_gap_alert_minutes", "ui_theme")) {
         if ($null -ne $body.$field) {
           $store.settings.$field = $body.$field
         }
@@ -1705,9 +2215,106 @@ function Handle-ApiRequest($Context) {
       }
       $report = Get-AuditReport $store $request
       New-ReportSnapshot $store $currentUser "audit" ([pscustomobject]@{ from = $report.from; to = $report.to; action = $report.action; user_id = $report.user_id }) @($report.rows).Count | Out-Null
-      Add-AuditLog $store $currentUser "audit.export" "audit" "csv" ([pscustomobject]@{ rows = @($report.rows).Count })
+      Add-AuditLog $store $currentUser "audit.export" "audit" "xls" ([pscustomobject]@{ rows = @($report.rows).Count })
       Save-Store $store
-      Send-DownloadText $Context (ConvertTo-CsvText (Get-AuditExportRows $report)) "text/csv; charset=utf-8" ("sword-auditoria-{0}.csv" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+      $summary = @(
+        [pscustomobject]@{ Indicador = "Eventos"; Valor = @($report.rows).Count },
+        [pscustomobject]@{ Indicador = "Periodo"; Valor = "$($report.from) ate $($report.to)" },
+        [pscustomobject]@{ Indicador = "Acao filtrada"; Valor = if ([string]::IsNullOrWhiteSpace($report.action)) { "Todas" } else { $report.action } }
+      )
+      Send-DownloadText $Context (ConvertTo-ExcelHtml "Sword - Auditoria" "Rastro de seguranca e operacao" (Get-AuditExportRows $report) $summary) "application/vnd.ms-excel; charset=utf-8" ("sword-auditoria-{0}.xls" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/major-incidents") {
+      Send-JsonArray $Context (Get-MajorIncidentRows $store)
+      return
+    }
+
+    if ($method -eq "GET" -and $path -eq "/api/major-incidents/export") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator")) -and $store.settings.allow_viewer_export -ne $true) {
+        Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite exportar incidentes." }) 403
+        return
+      }
+      $rows = @(Get-MajorIncidentExportRows $store)
+      New-ReportSnapshot $store $currentUser "major_incidents" ([pscustomobject]@{ scope = "all" }) $rows.Count | Out-Null
+      Add-AuditLog $store $currentUser "major_incidents.export" "major_incident" "xls" ([pscustomobject]@{ rows = $rows.Count })
+      Save-Store $store
+      $summary = @(
+        [pscustomobject]@{ Indicador = "Incidentes"; Valor = @(Get-CleanArray $store.major_incidents).Count },
+        [pscustomobject]@{ Indicador = "Pendentes"; Valor = @(Get-CleanArray $store.major_incidents | Where-Object { $_.status -ne "resolved" }).Count }
+      )
+      Send-DownloadText $Context (ConvertTo-ExcelHtml "Sword - Incidentes maiores" "Falhas massivas, host sem monitoramento e analises operacionais" $rows $summary) "application/vnd.ms-excel; charset=utf-8" ("sword-incidentes-maiores-{0}.xls" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+      return
+    }
+
+    if ($method -eq "GET" -and $segments.Count -eq 4 -and $segments[0] -eq "api" -and $segments[1] -eq "major-incidents" -and $segments[3] -eq "export") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator")) -and $store.settings.allow_viewer_export -ne $true) {
+        Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite exportar incidentes." }) 403
+        return
+      }
+      $incidentId = $segments[2]
+      $incident = @(Get-CleanArray $store.major_incidents | Where-Object { $_.id -eq $incidentId }) | Select-Object -First 1
+      if ($null -eq $incident) {
+        Send-Json $Context ([pscustomobject]@{ error = "Incidente nao encontrado." }) 404
+        return
+      }
+      $rows = @(Get-MajorIncidentExportRows $store $incidentId)
+      New-ReportSnapshot $store $currentUser "major_incident" ([pscustomobject]@{ incident_id = $incidentId }) $rows.Count | Out-Null
+      Add-AuditLog $store $currentUser "major_incidents.export_one" "major_incident" $incidentId ([pscustomobject]@{ rows = $rows.Count })
+      Save-Store $store
+      $summary = @(
+        [pscustomobject]@{ Indicador = "Incidente"; Valor = $incident.title },
+        [pscustomobject]@{ Indicador = "Status"; Valor = (Get-MajorIncidentStatusLabel $incident.status) },
+        [pscustomobject]@{ Indicador = "Afetados"; Valor = $incident.affected_count }
+      )
+      Send-DownloadText $Context (ConvertTo-ExcelHtml "Sword - Incidente maior" "Documento operacional para apresentacao e analise" $rows $summary) "application/vnd.ms-excel; charset=utf-8" ("sword-incidente-{0}.xls" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+      return
+    }
+
+    if ($method -eq "PUT" -and $segments.Count -eq 3 -and $segments[0] -eq "api" -and $segments[1] -eq "major-incidents") {
+      if (-not (Test-RoleAllowed $currentUser.role @("admin", "operator"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Seu cargo nao permite atualizar incidentes." }) 403
+        return
+      }
+      $incidentId = $segments[2]
+      $incident = @(Get-CleanArray $store.major_incidents | Where-Object { $_.id -eq $incidentId }) | Select-Object -First 1
+      if ($null -eq $incident) {
+        Send-Json $Context ([pscustomobject]@{ error = "Incidente nao encontrado." }) 404
+        return
+      }
+      $body = Read-RequestJson $request
+      if ($null -eq $body) {
+        Send-Json $Context ([pscustomobject]@{ error = "Corpo da requisicao invalido." }) 400
+        return
+      }
+      if ($null -ne $body.status -and -not (Test-AllowedValue "$($body.status)" @("open", "review", "resolved"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Status de incidente invalido." }) 400
+        return
+      }
+      if ($null -ne $body.incident_type -and -not (Test-AllowedValue "$($body.incident_type)" @("mass_outage", "switch_outage", "power_outage", "network_outage", "internet_outage", "sword_host_down", "maintenance", "other"))) {
+        Send-Json $Context ([pscustomobject]@{ error = "Tipo de incidente invalido." }) 400
+        return
+      }
+      foreach ($field in @("title", "incident_type", "status", "severity", "hypothesis", "root_cause", "impact_summary", "action_taken", "notes")) {
+        if ($null -ne $body.$field) {
+          if ("$($body.$field)".Length -gt 1200) {
+            Send-Json $Context ([pscustomobject]@{ error = "Campo $field excede o limite." }) 400
+            return
+          }
+          $incident.$field = "$($body.$field)"
+        }
+      }
+      if ($incident.status -eq "resolved" -and [string]::IsNullOrWhiteSpace($incident.resolved_at)) {
+        $incident.resolved_at = Get-NowIso
+      }
+      if (-not [string]::IsNullOrWhiteSpace($incident.resolved_at)) {
+        $incident.duration_seconds = [int][math]::Max(0, ([datetime]::Parse($incident.resolved_at) - [datetime]::Parse($incident.detected_at)).TotalSeconds)
+      }
+      $incident.updated_at = Get-NowIso
+      Add-AuditLog $store $currentUser "major_incidents.update" "major_incident" $incident.id ([pscustomobject]@{ status = $incident.status; type = $incident.incident_type })
+      Save-Store $store
+      Send-Json $Context ((Get-MajorIncidentRows $store | Where-Object { $_.id -eq $incident.id } | Select-Object -First 1))
       return
     }
 
@@ -1744,6 +2351,8 @@ function Handle-ApiRequest($Context) {
         devices = $store.devices
         status_events = $store.status_events
         alerts = $store.alerts
+        major_incidents = $store.major_incidents
+        monitor_state = $store.monitor_state
       })
       return
     }
@@ -1760,9 +2369,15 @@ function Handle-ApiRequest($Context) {
       }
       $report = Get-AvailabilityReport $store $request
       New-ReportSnapshot $store $currentUser "availability" ([pscustomobject]@{ from = $report.from; to = $report.to; device_id = $report.device_id }) @($report.rows).Count | Out-Null
-      Add-AuditLog $store $currentUser "reports.availability.export" "report" "csv" ([pscustomobject]@{ rows = @($report.rows).Count })
+      Add-AuditLog $store $currentUser "reports.availability.export" "report" "xls" ([pscustomobject]@{ rows = @($report.rows).Count })
       Save-Store $store
-      Send-DownloadText $Context (ConvertTo-CsvText (Get-AvailabilityExportRows $report)) "text/csv; charset=utf-8" ("sword-disponibilidade-{0}.csv" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+      $summary = @(
+        [pscustomobject]@{ Indicador = "Dispositivos avaliados"; Valor = $report.summary.devices },
+        [pscustomobject]@{ Indicador = "Disponibilidade media"; Valor = ("{0:N2}%" -f [double]$report.summary.availability_percent) },
+        [pscustomobject]@{ Indicador = "Tempo offline"; Valor = "$($report.summary.total_down_seconds)s" },
+        [pscustomobject]@{ Indicador = "Eventos"; Valor = $report.summary.events }
+      )
+      Send-DownloadText $Context (ConvertTo-ExcelHtml "Sword - Relatorio de disponibilidade" "SLA, indisponibilidade, MTTR e atencao operacional" (Get-AvailabilityExportRows $report) $summary) "application/vnd.ms-excel; charset=utf-8" ("sword-disponibilidade-{0}.xls" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
       return
     }
 
@@ -1778,9 +2393,15 @@ function Handle-ApiRequest($Context) {
       }
       $report = Get-HistoryReport $store $request
       New-ReportSnapshot $store $currentUser "history" ([pscustomobject]@{ from = $report.from; to = $report.to; device_id = $report.device_id }) @($report.rows).Count | Out-Null
-      Add-AuditLog $store $currentUser "history.export" "history" "csv" ([pscustomobject]@{ rows = @($report.rows).Count })
+      Add-AuditLog $store $currentUser "history.export" "history" "xls" ([pscustomobject]@{ rows = @($report.rows).Count })
       Save-Store $store
-      Send-DownloadText $Context (ConvertTo-CsvText (Get-HistoryExportRows $report)) "text/csv; charset=utf-8" ("sword-historico-{0}.csv" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
+      $summary = @(
+        [pscustomobject]@{ Indicador = "Eventos"; Valor = $report.summary.events },
+        [pscustomobject]@{ Indicador = "Abertos"; Valor = $report.summary.open_events },
+        [pscustomobject]@{ Indicador = "Resolvidos"; Valor = $report.summary.resolved_events },
+        [pscustomobject]@{ Indicador = "Duracao total"; Valor = "$($report.summary.total_duration_seconds)s" }
+      )
+      Send-DownloadText $Context (ConvertTo-ExcelHtml "Sword - Historico de disponibilidade" "Quedas, retornos, duracao e criticidade" (Get-HistoryExportRows $report) $summary) "application/vnd.ms-excel; charset=utf-8" ("sword-historico-{0}.xls" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
       return
     }
 
@@ -2009,6 +2630,13 @@ function Handle-ApiRequest($Context) {
         Send-Json $Context ([pscustomobject]@{ error = $bodyError }) 400
         return
       }
+      if ($null -ne $body.switch_id -and -not [string]::IsNullOrWhiteSpace($body.switch_id)) {
+        $linkedSwitch = Get-DeviceById $store "$($body.switch_id)"
+        if ($null -eq $linkedSwitch -or -not (Test-IsSwitchDevice $linkedSwitch)) {
+          Send-Json $Context ([pscustomobject]@{ error = "Switch vinculado nao encontrado." }) 400
+          return
+        }
+      }
 
       $now = Get-NowIso
       $device = New-DeviceFromBody $body $now
@@ -2039,6 +2667,17 @@ function Handle-ApiRequest($Context) {
           Send-Json $Context ([pscustomobject]@{ error = $bodyError }) 400
           return
         }
+        if ($null -ne $body.switch_id -and -not [string]::IsNullOrWhiteSpace($body.switch_id)) {
+          if ("$($body.switch_id)" -eq $device.id) {
+            Send-Json $Context ([pscustomobject]@{ error = "Um dispositivo nao pode ser vinculado a ele mesmo como switch." }) 400
+            return
+          }
+          $linkedSwitch = Get-DeviceById $store "$($body.switch_id)"
+          if ($null -eq $linkedSwitch -or -not (Test-IsSwitchDevice $linkedSwitch)) {
+            Send-Json $Context ([pscustomobject]@{ error = "Switch vinculado nao encontrado." }) 400
+            return
+          }
+        }
         Update-DeviceFromBody $device $body (Get-NowIso)
         Add-AuditLog $store $currentUser "devices.update" "device" $device.id $null
         Save-Store $store
@@ -2053,6 +2692,10 @@ function Handle-ApiRequest($Context) {
         }
 
         $eventIds = @(Get-CleanArray $store.status_events | Where-Object { $_.device_id -eq $deviceId } | ForEach-Object { $_.id })
+        foreach ($childDevice in @(Get-DevicesBySwitch $store $deviceId)) {
+          $childDevice.switch_id = ""
+          $childDevice.updated_at = Get-NowIso
+        }
         $store.devices = @(Get-CleanArray $store.devices | Where-Object { $_.id -ne $deviceId })
         $store.status_events = @(Get-CleanArray $store.status_events | Where-Object { $_.device_id -ne $deviceId })
         $store.alerts = @(Get-CleanArray $store.alerts | Where-Object { $_.device_id -ne $deviceId -and $eventIds -notcontains $_.status_event_id })
@@ -2104,9 +2747,8 @@ function Handle-ApiRequest($Context) {
       $beforeEvents = @(Get-CleanArray $store.status_events).Count
       $beforeAlerts = @(Get-CleanArray $store.alerts).Count
       if ($scope -eq "all") {
-        $store.status_events = @(Get-CleanArray $store.status_events | Where-Object { $_.status -eq "open" })
-        $openEventIds = @(Get-CleanArray $store.status_events | ForEach-Object { $_.id })
-        $store.alerts = @(Get-CleanArray $store.alerts | Where-Object { $_.status -eq "open" -and $openEventIds -contains $_.status_event_id })
+        $store.status_events = @()
+        $store.alerts = @()
       } else {
         $store.status_events = @(Get-CleanArray $store.status_events | Where-Object { $_.status -eq "open" })
         $store.alerts = @(Get-CleanArray $store.alerts | Where-Object { $_.status -eq "open" })
@@ -2177,6 +2819,8 @@ function Handle-StaticRequest($Context) {
 
 function Read-TcpHttpContext($Client) {
   $stream = $Client.GetStream()
+  $stream.ReadTimeout = 5000
+  $stream.WriteTimeout = 5000
   $buffer = New-Object byte[] 8192
   $memory = [System.IO.MemoryStream]::new()
   $headerEnd = -1
@@ -2266,13 +2910,21 @@ Write-Host "Infra Monitor MVP rodando em $prefix"
 Write-Host "Monitoramento: intervalo=${CheckIntervalSeconds}s, tentativas=$Attempts, timeout=${TimeoutMs}ms"
 Write-Host "Pressione Ctrl+C para parar."
 
-$nextCheck = (Get-Date).AddSeconds(2)
+try {
+  Register-SwordHostGap
+} catch {
+  Write-Warning "Falha ao registrar heartbeat inicial: $($_.Exception.Message)"
+}
+
+$startupSettings = Get-PublicSettings (Read-Store).settings
+$nextCheck = (Get-Date).AddSeconds([int]$startupSettings.check_interval_seconds)
 
 try {
   while ($true) {
-    if ((Get-Date) -ge $nextCheck) {
+    if ((Get-Date) -ge $nextCheck -and -not $listener.Pending()) {
       try {
-        $checked = Invoke-MonitorCycle
+        $cycleSettings = Get-PublicSettings (Read-Store).settings
+        $checked = Invoke-MonitorCycle ([int]$cycleSettings.monitor_batch_size)
         Write-Host ("Monitoramento executado: {0} dispositivo(s)." -f @($checked).Count)
       } catch {
         Write-Warning "Falha no ciclo de monitoramento: $($_.Exception.Message)"
@@ -2284,9 +2936,10 @@ try {
     $clientTask = $listener.AcceptTcpClientAsync()
     while (-not $clientTask.IsCompleted) {
       Start-Sleep -Milliseconds 150
-      if ((Get-Date) -ge $nextCheck) {
+      if ((Get-Date) -ge $nextCheck -and -not $listener.Pending()) {
         try {
-          $checked = Invoke-MonitorCycle
+          $cycleSettings = Get-PublicSettings (Read-Store).settings
+          $checked = Invoke-MonitorCycle ([int]$cycleSettings.monitor_batch_size)
           Write-Host ("Monitoramento executado: {0} dispositivo(s)." -f @($checked).Count)
         } catch {
           Write-Warning "Falha no ciclo de monitoramento: $($_.Exception.Message)"
